@@ -1,0 +1,147 @@
+import pandas as pd
+import numpy as np
+import re
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Font, PatternFill, Alignment
+
+
+def clean_mpd(file_path, output_csv="task_occurrence(2).csv"):
+    df_raw = pd.ExcelFile(file_path).parse(0)
+
+    # --- Rename columns to normalized names ---
+    df = df_raw.rename(columns={
+        "TASK\nNUMBER": "TaskID",
+        "ZONE": "Zone",
+        "TASK CODE": "TaskType",
+        "TASK\nM.H.": "TaskMH",
+        "ACCESS\nM.H.": "AccessMH",
+        "PREP.\nM.H.": "PrepMH",
+        "MEN": "Men",
+        "TCI": "TCU",
+        "TPS": "TPS",
+        "SAMPLE\nTHRESHOLD": "SampleThreshold",
+        "SAMPLE\nINTERVAL": "SampleInterval",
+        "100%\nTHRESHOLD": "Threshold100",
+        "100%\nINTERVAL": "Interval100"
+    })
+
+    # --- Enhanced threshold parser with flags ---
+    def parse_threshold_with_flags(val):
+        if pd.isna(val): 
+            return {"fh": 0, "note": False, "act": False, "ce": False}
+        
+        val = str(val).upper().replace("\n", " ")
+        FH_per_day = 8
+        FH_per_fc = 1.5
+        FH_per_mo = 30 * FH_per_day
+
+        note_flag = "NOTE" in val
+        act_flag = "ACT" in val
+        ce_flag = "CE" in val
+
+        matches = re.findall(r"(\d+)\s*(YE|MO|DY|FC|FH|ACT YE)", val)
+        fh_values = []
+
+        for num, unit in matches:
+            num = int(num)
+            if unit == "YE" or unit == "ACT YE":
+                fh_values.append(num * 365 * FH_per_day)
+            elif unit == "MO":
+                fh_values.append(num * FH_per_mo)
+            elif unit == "DY":
+                fh_values.append(num * FH_per_dy)
+            elif unit == "FC":
+                fh_values.append(num * FH_per_fc)
+            elif unit == "FH":
+                fh_values.append(num)
+
+        return {
+            "fh": min(fh_values) if fh_values else 0,
+            "note": note_flag,
+            "act": act_flag,
+            "ce": ce_flag
+        }
+
+    # --- Apply parser to threshold columns ---
+    threshold_cols = ["SampleThreshold", "SampleInterval", "Threshold100", "Interval100"]
+    for col in threshold_cols:
+        parsed = df[col].apply(parse_threshold_with_flags)
+        df[f"{col}_FH"] = parsed.apply(lambda x: x["fh"])
+        df[f"{col}_NOTE"] = parsed.apply(lambda x: x["note"])
+        df[f"{col}_ACT"] = parsed.apply(lambda x: x["act"])
+        df[f"{col}_CE"] = parsed.apply(lambda x: x["ce"])
+
+    # --- Fallback logic for missing sample thresholds ---
+    df["SampleThreshold_FH"] = np.where(df["SampleThreshold_FH"] == 0, df["Threshold100_FH"], df["SampleThreshold_FH"])
+    df["SampleInterval_FH"] = np.where(df["SampleInterval_FH"] == 0, df["Interval100_FH"], df["SampleInterval_FH"])
+
+    # --- Fill missing values ---
+    df["TCU"] = df["TCU"].apply(lambda x: 1 if str(x).strip().upper() == "T" else 0)
+    for col in ["TaskMH", "AccessMH", "PrepMH", "Men"]:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # --- Parse TPS into three flags ---
+    def parse_tps(val):
+        if pd.isna(val) or str(val).strip() == "":
+            return {"TPS1": 0, "TPS2": 0, "TPS3": 0}
+        v = str(val).strip().upper()
+        if v == "NO":
+            return {"TPS1": 0, "TPS2": 0, "TPS3": 0}
+        return {
+            "TPS1": 1 if "1" in v else 0,
+            "TPS2": 1 if "2" in v else 0,
+            "TPS3": 1 if "3" in v else 0
+        }
+
+    tps_flags = df["TPS"].apply(parse_tps)
+    df["TPS1"] = tps_flags.apply(lambda x: x["TPS1"])
+    df["TPS2"] = tps_flags.apply(lambda x: x["TPS2"])
+    df["TPS3"] = tps_flags.apply(lambda x: x["TPS3"])
+
+    # --- SDI logic: If SDI & Men == 0 → TaskMH & AccessMH = 0 ---
+    sdi_mask = (df["TaskType"] == "SDI") & (df["Men"] == 0)
+    df.loc[sdi_mask, ["TaskMH", "AccessMH"]] = 0
+
+    # --- Derive total manhours ---
+    df["ManhoursRT"] = df.apply(
+        lambda r: r["PrepMH"] + r["AccessMH"] + r["TaskMH"] if r["TaskType"] != "SDI" else r["PrepMH"],
+        axis=1
+    )
+
+    # --- Final cleaned dataset ---
+    df_final = df[[
+        "TaskID", "Zone", "TaskType", "Men",
+        "TaskMH", "AccessMH", "PrepMH", "ManhoursRT",
+        "TPS1", "TPS2", "TPS3", "TCU",
+        "SampleThreshold_FH", "SampleInterval_FH",
+        "Threshold100_FH", "Interval100_FH",
+        "SampleThreshold_NOTE", "SampleThreshold_ACT", "SampleThreshold_CE",
+        "SampleInterval_NOTE", "SampleInterval_ACT", "SampleInterval_CE",
+        "Threshold100_NOTE", "Threshold100_ACT", "Threshold100_CE",
+        "Interval100_NOTE", "Interval100_ACT", "Interval100_CE"
+    ]]
+
+    df_final.to_csv(output_csv, index=False)
+    return df_final
+
+def export_to_excel(df, output_path="Cleaned_MPD_Data.xlsx"):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cleaned MPD Data"
+    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), 1):
+        ws.append(row)
+        for cell in ws[r_idx]:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if r_idx == 1:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="4F81BD")
+    for col in ws.columns:
+        max_length = max(len(str(cell.value)) if cell.value else 0 for cell in col)
+        ws.column_dimensions[col[0].column_letter].width = max_length + 2
+    wb.save(output_path)
+
+# Run
+file_path = "MPD_sample.xlsx"  # <-- Replace with your actual path
+df_clean = clean_mpd(file_path)
+export_to_excel(df_clean, "Cleaned_MPD_Data(New).xlsx")
