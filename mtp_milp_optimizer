@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# mtp_milp_from_baseline.py
 """
 MILP optimizer (Pyomo + Gurobi) aligned to the baseline heuristic logic.
 
