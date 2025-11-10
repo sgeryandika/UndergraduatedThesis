@@ -1,5 +1,5 @@
 """
-MILP optimizer (Pyomo + Gurobi) aligned to the baseline heuristic logic.
+MILP optimizer (Pyomo + Gurobi) aligned to the baseline logic.
 
 How it works (summary):
 - Reads optimizer_input CSV (RowID, TaskID, IntervalFH, ManhoursRT, Men, Categories, Zone)
