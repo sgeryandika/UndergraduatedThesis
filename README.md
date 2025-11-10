@@ -62,6 +62,14 @@ All code was reviewed and adapted to ensure correctness.
 
 ---
 
+## 🔍 Feedback & Verification
+
+While all code has been reviewed, I acknowledge that **slip-ups, loopholes, or mistakes** may still exist.  
+Any further advice, verification, or suggestions for improvement are very welcome.  
+Please feel free to open issues or pull requests to help strengthen the project.
+
+---
+
 ## 📜 License
 
 This project is licensed under the **MIT License**.  
