@@ -29,17 +29,21 @@ The project explores how to optimize maintenance tasks packaging using **heurist
 
 ## 🚀 How to Use
 
-1. **Preprocess data**  
-   Run scripts in `mtp_preprocessing` to generate input files.
 
-2. **Run heuristic baseline**  
-   Execute code in `mtp_heuristic_baseline` to produce quick schedules.
-
-3. **Run MILP optimizer**  
-   Use `mtp_milp_optimizer` to compute optimal schedules under surrogate models.
-
-4. **Frontend interaction**  
+1. **Frontend interaction**  
    `mtp_frontend` provides a simple interface to combine preprocessing and optimization runs.
+
+2. **Run the frontend**  
+   Start with the scripts in `mtp_frontend`. This is the main entry point that will automatically call the preprocessing routines, generate the required input files, and then pass them to the optimizers.
+
+3. **Preprocessing (handled by frontend)**  
+   The `mtp_preprocessing` module is invoked by the frontend to prepare data and constraints. You normally don’t need to run this separately unless you want to inspect or customize the input generation.
+
+4. **Run heuristic baseline (optional)**  
+   The frontend can trigger `mtp_heuristic_baseline` to produce quick schedules for comparison. You may also run this module directly if you want to test heuristics independently.
+
+5. **Run MILP optimizer**  
+   The frontend can also call `mtp_milp_optimizer` to compute optimal schedules under surrogate models. Like the heuristic baseline, you can run this module directly for standalone experiments.
 
 ---
 
