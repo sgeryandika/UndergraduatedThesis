@@ -1,0 +1,378 @@
+"""
+Integrated Frontend for MPD Preprocessing and Optimizers
+-------------------------------------------------------
+
+Combines original lightweight GUI with:
+✅ Advanced preprocessing (progress bar + threaded)
+✅ Interval range inputs (A_min, A_max, A_step, C_min, C_max, C_step)
+✅ Planning Horizon (H)
+✅ Manual launch for baseline and MILP optimizers
+✅ Real-time stdout logging
+✅ Optional Excel export
+✅ “View optimizer_input.csv” button
+
+Requires:
+ - mtp_preprocessing.py  (with progress_callback support)
+ - mtp_heuristic_baseline.py
+ - mtp_milp_optimizer.py
+"""
+
+import os
+import sys
+import json
+import shlex
+import threading
+import traceback
+import subprocess
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+# --- Import Preprocessing Module ---
+try:
+    from mtp_preprocessing import clean_mpd, export_to_excel
+except Exception as e:
+    clean_mpd = None
+    export_to_excel = None
+    import_error = e
+else:
+    import_error = None
+
+# --- Paths to Optimizers ---
+BASELINE_SCRIPT = Path("mtp_heuristic_baseline.py")
+MILP_SCRIPT = Path("mtp_milp_optimizer.py")
+
+
+class MPDFrontend(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("MPD Preprocessing and Optimizer Frontend")
+        self.geometry("940x640")
+        self.resizable(True, True)
+
+        # Variables
+        self.mpd_path = tk.StringVar()
+        self.conv_file = tk.StringVar()
+        self.output_csv = tk.StringVar(value="Cleaned_MPD_Data.csv")
+        self.output_xlsx = tk.StringVar(value="Cleaned_MPD_Data.xlsx")
+        self.output_dir = tk.StringVar(value="output")
+        self.fh_per_day = tk.StringVar(value="8")
+        self.fh_per_fc = tk.StringVar(value="1.5")
+        self.fh_per_mo = tk.StringVar(value="")  # empty means "auto"
+        self.use_conv_file = tk.BooleanVar(value=False)
+        self.export_excel = tk.BooleanVar(value=False)
+        self.run_button = None
+
+        # Optimizer params
+        self.A_min = tk.StringVar(value="400")
+        self.A_max = tk.StringVar(value="1000")
+        self.A_step = tk.StringVar(value="100")
+        self.C_min = tk.StringVar(value="4000")
+        self.C_max = tk.StringVar(value="9000")
+        self.C_step = tk.StringVar(value="1000")
+        self.H = tk.StringVar(value="24000")
+
+        self._build_ui()
+
+    # ----------------------------------------------------------
+    def _build_ui(self):
+        padx, pady = 8, 6
+
+        # --- MPD File ---
+        frm_top = tk.Frame(self)
+        frm_top.pack(fill=tk.X, padx=padx, pady=(pady, 2))
+        tk.Label(frm_top, text="MPD Excel file:").grid(row=0, column=0, sticky=tk.W)
+        tk.Entry(frm_top, textvariable=self.mpd_path, width=80).grid(row=0, column=1, padx=6)
+        tk.Button(frm_top, text="Browse...", command=self.browse_mpd).grid(row=0, column=2)
+
+        # --- Conversion Inputs ---
+        frm_conv = tk.LabelFrame(self, text="Conversion (utilization) settings")
+        frm_conv.pack(fill=tk.X, padx=padx, pady=(2, pady))
+        """
+        tk.Label(frm_conv, text="FH_per_day:").grid(row=0, column=0, sticky=tk.E)
+        tk.Entry(frm_conv, textvariable=self.fh_per_day, width=10).grid(row=0, column=1, sticky=tk.W)
+        tk.Label(frm_conv, text="FH_per_fc:").grid(row=0, column=2, sticky=tk.E)
+        tk.Entry(frm_conv, textvariable=self.fh_per_fc, width=10).grid(row=0, column=3, sticky=tk.W)
+        tk.Label(frm_conv, text="FH_per_mo (optional):").grid(row=0, column=4, sticky=tk.E)
+        tk.Entry(frm_conv, textvariable=self.fh_per_mo, width=10).grid(row=0, column=5, sticky=tk.W)
+        """
+        # Conversion file or manual overrides
+        tk.Checkbutton(frm_conv, text="Load from conversion JSON file", variable=self.use_conv_file, command=self._toggle_conv_file).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(4, 2))
+
+        tk.Label(frm_conv, text="Conversion JSON:").grid(row=1, column=0, sticky=tk.W)
+        tk.Entry(frm_conv, textvariable=self.conv_file, width=58).grid(row=1, column=1)
+        tk.Button(frm_conv, text="Browse...", command=self.browse_conv_file).grid(row=1, column=2)
+
+        # Manual overrides
+        tk.Label(frm_conv, text="FH_per_day:").grid(row=2, column=0, sticky=tk.E)
+        tk.Entry(frm_conv, textvariable=self.fh_per_day, width=10).grid(row=2, column=1, sticky=tk.W)
+        tk.Label(frm_conv, text="FH_per_fc:").grid(row=2, column=1, padx=(120,0), sticky=tk.E)
+        tk.Entry(frm_conv, textvariable=self.fh_per_fc, width=8).grid(row=2, column=1, sticky=tk.W, padx=(200,0))
+
+        tk.Label(frm_conv, text="FH_per_mo (optional):").grid(row=3, column=0, sticky=tk.E, pady=(4,0))
+        tk.Entry(frm_conv, textvariable=self.fh_per_mo, width=12).grid(row=3, column=1, sticky=tk.W, pady=(4,0))
+        tk.Label(frm_conv, text="(leave blank to use 30 * FH_per_day)").grid(row=3, column=1, sticky=tk.W, padx=(120,0), pady=(4,0))
+
+        # --- Output Folder ---
+        frm_out = tk.LabelFrame(self, text="Output Folder")
+        frm_out.pack(fill=tk.X, padx=padx, pady=(2, pady))
+        tk.Label(frm_out, text="Output directory:").grid(row=0, column=0, sticky=tk.W)
+        tk.Entry(frm_out, textvariable=self.output_dir, width=70).grid(row=0, column=1, padx=6)
+        tk.Button(frm_out, text="Browse...", command=self.choose_output_dir).grid(row=0, column=2)
+        tk.Checkbutton(frm_out, text="Export Excel", variable=self.export_excel).grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        
+        # Output options
+        tk.Checkbutton(frm_out, text="Export to Excel (XLSX)", variable=self.export_excel, command=self._toggle_excel).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(6,0))
+        tk.Entry(frm_out, textvariable=self.output_xlsx, width=60, state=tk.DISABLED).grid(row=2, column=1, padx=6)
+        tk.Button(frm_out, text="Choose...", command=self.choose_output_xlsx, state=tk.DISABLED).grid(row=2, column=2)
+
+        # --- Preprocessing Controls ---
+        frm_ctrl = tk.Frame(self)
+        frm_ctrl.pack(fill=tk.X, padx=padx, pady=(2, pady))
+        tk.Button(frm_ctrl, text="Run Preprocessing", width=20, command=self.run_cleaning).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(frm_ctrl, text="Open Output Folder", command=self.open_output_folder).pack(side=tk.LEFT, padx=4)
+        tk.Button(frm_ctrl, text="Quit", command=self.quit).pack(side=tk.RIGHT, padx=4)
+        
+        # --- Optimizer Section ---
+        frm_opt = tk.LabelFrame(self, text="Optimizer (Manual Launch)")
+        frm_opt.pack(fill=tk.X, padx=padx, pady=6)
+
+        tk.Button(frm_opt, text="Run Baseline Optimizer", command=lambda: self.run_optimizer(BASELINE_SCRIPT, "BASELINE")).grid(row=0, column=0, padx=4, pady=6)
+        tk.Button(frm_opt, text="Run MILP Optimizer", command=lambda: self.run_optimizer(MILP_SCRIPT, "MILP")).grid(row=0, column=1, padx=4, pady=6)
+        tk.Button(frm_opt, text="View Optimizer Input", command=self.view_optimizer_input).grid(row=0, column=2, padx=4, pady=6)
+
+        # --- Interval Inputs ---
+        labels = [("A_min", self.A_min), ("A_max", self.A_max), ("A_step", self.A_step),
+                  ("C_min", self.C_min), ("C_max", self.C_max), ("C_step", self.C_step)]
+        for i, (lbl, var) in enumerate(labels):
+            tk.Label(frm_opt, text=f"{lbl}:").grid(row=1 + i // 3, column=(i % 3) * 2, sticky=tk.E)
+            tk.Entry(frm_opt, textvariable=var, width=8).grid(row=1 + i // 3, column=(i % 3) * 2 + 1, sticky=tk.W)
+
+        tk.Label(frm_opt, text="Planning Horizon (H):").grid(row=3, column=0, sticky=tk.E)
+        tk.Entry(frm_opt, textvariable=self.H, width=10).grid(row=3, column=1, sticky=tk.W)
+
+        # --- Progress and Log ---
+        frm_log = tk.LabelFrame(self, text="Status / Log")
+        frm_log.pack(fill=tk.BOTH, expand=True, padx=padx, pady=(2, pady))
+        self.progress = ttk.Progressbar(frm_log, orient="horizontal", mode="determinate", maximum=100)
+        self.progress.pack(fill=tk.X, padx=6, pady=6)
+        self.txt_log = tk.Text(frm_log, height=18, state=tk.DISABLED)
+        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        # store references to widgets we need to enable/disable
+        self._output_xlsx_entry = frm_out.grid_slaves(row=2, column=1)[0]
+        self._output_xlsx_btn = frm_out.grid_slaves(row=2, column=2)[0]
+        self._conv_entry = frm_conv.grid_slaves(row=1, column=1)[0]
+
+        # initialize toggles
+        self._toggle_conv_file()
+        self._toggle_excel()
+
+        # If import error occurred, show a warning
+        if import_error is not None:
+            self.log(f"[WARN] Preprocessing module import failed: {import_error}")
+            self.log("Make sure mtp_preprocessing.py exists in the same folder and defines clean_mpd and export_to_excel.")
+
+
+    # ----------------------------------------------------------
+    def log(self, msg):
+        self.txt_log.config(state=tk.NORMAL)
+        self.txt_log.insert(tk.END, msg + "\n")
+        self.txt_log.see(tk.END)
+        self.txt_log.config(state=tk.DISABLED)
+
+    # --- File Handling ---
+    def browse_mpd(self):
+        p = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx;*.xls")])
+        if p: self.mpd_path.set(p)
+
+    def browse_conv_file(self):
+        p = filedialog.askopenfilename(filetypes=[("JSON files", "*.json"), ("All files", "*")])
+        if p:
+            self.conv_file.set(p)
+
+    def choose_output_csv(self):
+        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
+        if p:
+            self.output_csv.set(p)
+
+    def choose_output_xlsx(self):
+        p = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files","*.xlsx")])
+        if p:
+            self.output_xlsx.set(p)
+            self._output_xlsx_entry.config(state=tk.NORMAL)
+
+    def _toggle_conv_file(self):
+        if self.use_conv_file.get():
+            self._conv_entry.config(state=tk.NORMAL)
+        else:
+            self._conv_entry.config(state=tk.DISABLED)
+
+    def _toggle_excel(self):
+        if self.export_excel.get():
+            self._output_xlsx_entry.config(state=tk.NORMAL)
+            self._output_xlsx_btn.config(state=tk.NORMAL)
+        else:
+            self._output_xlsx_entry.config(state=tk.DISABLED)
+            self._output_xlsx_btn.config(state=tk.DISABLED)
+
+    def choose_output_dir(self):
+        p = filedialog.askdirectory()
+        if p: self.output_dir.set(p)
+
+    def open_output_folder(self):
+        out = Path(self.output_dir.get() or "output")
+        if not out.exists():
+            messagebox.showwarning("Missing Folder", f"{out} does not exist.")
+            return
+        try:
+            if sys.platform.startswith("win"): os.startfile(out)
+            elif sys.platform == "darwin": subprocess.run(["open", out])
+            else: subprocess.run(["xdg-open", out])
+        except Exception as e:
+            self.log(f"[ERROR] Could not open folder: {e}")
+
+    def view_optimizer_input(self):
+        path = Path(self.output_dir.get() or "output") / "optimizer_input.csv"
+        if not path.exists():
+            messagebox.showwarning("File not found", str(path))
+            return
+        try:
+            if sys.platform.startswith("win"): os.startfile(str(path))
+            elif sys.platform == "darwin": subprocess.run(["open", str(path)])
+            else: subprocess.run(["xdg-open", str(path)])
+            self.log(f"[INFO] Opened: {path}")
+        except Exception as e:
+            self.log(f"[ERROR] Failed to open file: {e}")
+
+    # ----------------------------------------------------------
+    # Preprocessing logic
+    def run_cleaning(self):
+        if clean_mpd is None:
+            messagebox.showerror("Error", "mtp_preprocessing.py not found or invalid.")
+            return
+
+        mpd_file = self.mpd_path.get().strip()
+        if not mpd_file:
+            messagebox.showwarning("Missing Input", "Please select an MPD Excel file.")
+            return
+
+        output_dir = self.output_dir.get().strip() or "output"
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        out_csv = self.output_csv.get().strip() or "Cleaned_MPD_Data.csv"
+        out_xlsx = self.output_xlsx.get().strip() if self.export_excel.get() else None
+
+        # build conversion constants
+        fh_day = None
+        fh_fc = None
+        fh_mo = None
+
+        if self.use_conv_file.get():
+            conv_path = self.conv_file.get().strip()
+            if not conv_path:
+                messagebox.showwarning("Conversion file", "Please select a conversion JSON file or disable the checkbox.")
+                return
+            try:
+                with open(conv_path, 'r', encoding='utf-8') as f:
+                    conv = json.load(f)
+                fh_day = float(conv.get('FH_per_day', 8))
+                fh_fc = float(conv.get('FH_per_fc', 1.5))
+                fh_mo = conv.get('FH_per_mo')
+                if fh_mo is not None:
+                    fh_mo = float(fh_mo)
+            except Exception as e:
+                messagebox.showerror("Conversion file error", f"Failed to read conversion file: {e}")
+                return
+        else:
+            # manual fields
+            try:
+                fh_day = float(self.fh_per_day.get()) if self.fh_per_day.get().strip() else 8.0
+                fh_fc = float(self.fh_per_fc.get()) if self.fh_per_fc.get().strip() else 1.5
+                fh_mo = float(self.fh_per_mo.get()) if self.fh_per_mo.get().strip() else None
+            except Exception as e:
+                messagebox.showerror("Conversion value error", f"Invalid conversion numeric input: {e}")
+                return
+
+        self.progress["value"] = 0
+        self.progress.config(mode="determinate")
+        self.log(f"[INFO] Starting preprocessing ({mpd_file})...")
+
+        def progress_callback(current, total):
+            pct = int((current / total) * 100)
+            self.progress["value"] = pct
+            self.update_idletasks()
+
+        def worker():
+            try:
+                df, opt_path, total, valid = clean_mpd(
+                    mpd_file,
+                    output_dir=output_dir,
+                    FH_per_day=fh_day,
+                    FH_per_fc=fh_fc,
+                    FH_per_mo=fh_mo,
+                    progress_callback=progress_callback,
+                )
+
+                if self.export_excel.get():
+                    export_to_excel(df, Path(output_dir) / "Cleaned_MPD_Data.xlsx")
+                self.progress["value"] = 100
+                self.log(f"[INFO] Preprocessing complete: {total} total, {valid} valid optimizer tasks.")
+                    
+            except Exception as e:
+                self.log(f"[ERROR] Preprocessing failed: {e}")
+                self.log(traceback.format_exc())
+                messagebox.showerror("Error", f"Preprocessing failed. See status for details.\n{e}")
+            
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ----------------------------------------------------------
+    # Optimizer logic
+    def run_optimizer(self, script_path: Path, label: str):
+        input_file = Path(self.output_dir.get() or "output") / "optimizer_input.csv"
+        if not input_file.exists():
+            messagebox.showwarning("Missing Input", "Run preprocessing first to generate optimizer_input.csv.")
+            return
+        if not script_path.exists():
+            messagebox.showwarning("Missing Script", f"{script_path} not found.")
+            return
+
+        cmd = (
+            f"python {shlex.quote(str(script_path))} "
+            f"--input {shlex.quote(str(input_file))} "
+            f"--A_min {self.A_min.get()} --A_max {self.A_max.get()} --A_step {self.A_step.get()} "
+            f"--C_min {self.C_min.get()} --C_max {self.C_max.get()} --C_step {self.C_step.get()} "
+            f"--H {self.H.get()} "
+            "--save_validation --save_package_summary"
+        )
+
+        self.log(f"[INFO] Launching {label} optimizer...")
+        self.log(f"[INFO] Intervals: A={self.A_min.get()}–{self.A_max.get()} step {self.A_step.get()}, "
+                 f"C={self.C_min.get()}–{self.C_max.get()} step {self.C_step.get()}, H={self.H.get()}")
+
+        def worker():
+            self.progress.config(mode="indeterminate")
+            self.progress.start(15)
+            try:
+                proc = subprocess.Popen(shlex.split(cmd), shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in iter(proc.stdout.readline, ''):
+                    if not line:
+                        break
+                    self.log(f"[{label}] {line.strip()}")
+                proc.wait()
+                if proc.returncode == 0:
+                    self.log(f"[INFO] {label} optimizer finished successfully.")
+                else:
+                    self.log(f"[ERROR] {label} optimizer exited with code {proc.returncode}")
+            except Exception as e:
+                self.log(f"[ERROR] {label} run failed: {e}")
+                self.log(traceback.format_exc())
+            finally:
+                self.progress.stop()
+                self.progress.config(mode="determinate")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    app = MPDFrontend()
+    app.mainloop()
