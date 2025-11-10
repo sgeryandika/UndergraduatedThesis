@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+# mtp_milp_from_baseline.py
+"""
+MILP optimizer (Pyomo + Gurobi) aligned to the baseline heuristic logic.
+
+How it works (summary):
+- Reads optimizer_input CSV (RowID, TaskID, IntervalFH, ManhoursRT, Men, Categories, Zone)
+- For each (A, C) pair in provided A_candidates and C_candidates:
+    - Uses baseline mapping function `map_task_occurrences_to_bins` (identical rules) to produce candidate (task,bin) allowed pairs.
+    - Builds a compact Pyomo MILP with variables:
+        x[i,t] in {0,1}  (task i assigned to candidate bin t)
+        v[t]  in {0,1}   (bin t used)
+      and constraints:
+        - each task assigned exactly once (if it has candidate bins; 'line' tasks are left unpackaged)
+        - capacity (sum mh <= Wpeak * v[t])
+        - x <= v linking
+    - Objective: linear surrogate of baseline cost (open + direct labor*phi + material fraction + linearized downtime proxy)
+    - Solve MILP with Gurobi
+    - Extract assignment, then **recompute exact baseline cost decomposition** (using compute_costs_from_locked) for the selected assignment (this guarantees reported cost = baseline formula)
+- Select best (A,C) by the exact recomputed baseline cost (not by surrogate objective).
+- Output: final task-to-bin matrix, package summary, baseline cost decomposition, and plots.
+
+Notes:
+- This program purposely keeps "baseline logic" (bin generation, candidate mapping) unchanged.
+- Downtime/opportunity line-costs are computed exactly post-solve (not linearized inside the MILP objective). The MILP uses a consistent linear proxy so solver is incentivized correctly.
+- Uses Pyomo to build/solve MIP with Gurobi backend. If you prefer direct Gurobi Python API, translate accordingly.
+"""
+
+import os
+import math
+import argparse
+import time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+# Pyomo & solver
+import pyomo.environ as pyo
+from pyomo.opt import SolverFactory
+
+# plotting
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# Params dataclass (copied & simplified from baseline)
+# ---------------------------
+@dataclass
+class Params:
+    phi: float = 4/3
+    labor_rate: float = 25.0
+    material_fraction: float = 0.33
+    revenue_per_hour: float = 2000.0
+    ohA: float = 15000.0
+    ohC: float = 80000.0
+    ohL: float = 500.0
+    shift_hours: float = 8.0
+    mh_per_shift_A: float = 48.0
+    mh_per_shift_C: float = 90.0
+    H: int = 180000
+
+
+# ---------------------------
+# Reuse baseline helper functions (generate_bins, mapping)
+# Note: these functions are adapted 1:1 from your baseline file to keep logic identical.
+# ---------------------------
+def generate_bins(horizon: int, A: int, C: int) -> np.ndarray:
+    if A <= 0 or C <= 0:
+        raise ValueError("A and C must be positive integers.")
+    a_bins = np.arange(A, horizon + 1, A, dtype=int)
+    c_bins = np.arange(C, horizon + 1, C, dtype=int)
+    bins = np.unique(np.concatenate([a_bins, c_bins]))
+    return bins
+
+
+def map_task_occurrences_to_bins(tasks_df: pd.DataFrame, A: int, C: int, H: int, mode: str = 'equalized') -> pd.DataFrame:
+    """
+    Identical logic to baseline: produce candidate rows for each task occurrence -> candidate bin.
+    Output columns:
+      task_id, due, bin, mh, method, check_level, slack, category
+    This function is intentionally unchanged from baseline logic so the MILP's feasible set matches baseline.
+    """
+    records = []
+    bins = generate_bins(H, A, C)
+
+    for _, row in tasks_df.iterrows():
+        tid = str(row['task_id'])
+        interval = float(row['interval_fh'])
+        mh = float(row['manhours'])
+        cat = int(row.get('category', 0))
+
+        # leave tasks with interval < A as line candidates (no package candidates)
+        if interval < A or interval <= 0:
+            continue
+
+        kmax = int(math.floor(H / interval))
+        if kmax <= 0:
+            continue
+        dues = (np.arange(1, kmax + 1) * interval).astype(int)
+
+        if interval < C:
+            for d in dues:
+                valid_bins = bins[bins <= d]
+                if valid_bins.size == 0:
+                    continue
+                a_cands = valid_bins[valid_bins % A == 0]
+                if a_cands.size == 0:
+                    continue
+                chosen_bin = int(a_cands[-1])   # prefer A multiple
+                # Adaptive A stop rule
+                next_C_multiple = math.ceil(chosen_bin / C) * C
+                if chosen_bin > next_C_multiple:
+                    continue
+                slack = max(interval - chosen_bin, 0.0)
+                records.append((tid, int(d), chosen_bin, float(mh), 'A-assign', 'A', slack, cat))
+        else:
+            if mode == 'block':
+                for d in dues:
+                    c_cands = bins[(bins <= d) & (bins % C == 0)]
+                    if c_cands.size > 0:
+                        chosen_bin = int(c_cands[-1])
+                    else:
+                        valid_bins = bins[bins <= d]
+                        if valid_bins.size == 0:
+                            continue
+                        chosen_bin = int(valid_bins[-1])
+                    slack = max(interval - chosen_bin, 0.0)
+                    records.append((tid, int(d), chosen_bin, float(mh), 'C-block', 'C', slack, cat))
+            else:
+                for d in dues:
+                    window_start = max(0, d - C)
+                    first_a = ((window_start // A) + 1) * A
+                    a_list = np.arange(first_a, d + 1, A, dtype=int)
+                    a_list = a_list[a_list >= A]
+                    if a_list.size == 0:
+                        c_cands = bins[(bins <= d) & (bins % C == 0)]
+                        if c_cands.size == 0:
+                            continue
+                        chosen_bin = int(c_cands[-1])
+                        slack = max(interval - chosen_bin, 0.0)
+                        records.append((tid, int(d), chosen_bin, float(mh), 'C-eq-fallback', 'C', slack, cat))
+                    else:
+                        per_mh = float(mh / a_list.size)
+                        for a_bin in a_list:
+                            next_C_multiple = math.ceil(a_bin / C) * C
+                            if a_bin > next_C_multiple:
+                                continue
+                            slack = max(interval - a_bin, 0.0)
+                            records.append((tid, int(d), int(a_bin), per_mh, 'C-eq', 'C', slack, cat))
+
+    cols = ['task_id', 'due', 'bin', 'mh', 'method', 'check_level', 'slack', 'category']
+    if not records:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(records, columns=cols)
+    df = df.groupby(['task_id', 'due', 'bin', 'method', 'check_level', 'slack', 'category'], as_index=False)['mh'].sum()
+    return df
+
+
+# ---------------------------
+# Baseline exact cost computation (copied/adapted)
+# This is used for final, exact cost recomputation and reporting.
+# ---------------------------
+def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, params: Params, A: int, C: int, H: int) -> Dict[str, float]:
+    """
+    Exactly same decomposition as baseline: direct, material, overhead, downtime, line_cost, opportunity.
+    This function is used to compute and report the final exact cost of any candidate assignment.
+    """
+    total_mh = float(locked['mh'].sum()) if (locked is not None and not locked.empty) else 0.0
+    direct_labour = params.labor_rate * total_mh
+    direct = params.phi * direct_labour
+    material = params.material_fraction * direct_labour
+
+    overhead_total = 0.0
+    downtime_total = 0.0
+    opportunity_cost = 0.0
+    line_cost = 0.0
+
+    if locked is not None and not locked.empty:
+        men_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['men'].astype(float)))
+        df = locked.copy()
+        df['men'] = df['task_id'].map(men_map).fillna(0.0)
+        bin_summary = df.groupby('bin', as_index=False).agg(total_mh=('mh', 'sum'), total_men=('men', 'sum'))
+        bin_summary['is_c'] = bin_summary['bin'] % C == 0
+        bin_summary['overhead'] = bin_summary['is_c'].apply(lambda x: params.ohC if x else params.ohA)
+        overhead_total = float(bin_summary['overhead'].sum())
+
+        def downtime_cost_calc(r):
+            if r['total_men'] > 0:
+                downtime_hours = float(r['total_mh']) / float(r['total_men'])
+                return downtime_hours * params.revenue_per_hour
+            else:
+                cap = params.mh_per_shift_C if r['is_c'] else params.mh_per_shift_A
+                shifts = math.ceil(float(r['total_mh']) / cap) if cap > 0 else 0
+                downtime_hours = shifts * params.shift_hours
+                return downtime_hours * params.revenue_per_hour
+        bin_summary['downtime_cost'] = bin_summary.apply(downtime_cost_calc, axis=1)
+        downtime_total = float(bin_summary['downtime_cost'].sum())
+
+        orig_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['interval_fh'].astype(float)))
+        first_assigned = locked.groupby('task_id', as_index=False).agg({'bin': 'min'})
+        for _, r in first_assigned.iterrows():
+            tid = str(r['task_id'])
+            assigned_bin = int(r['bin'])
+            orig_int = orig_map.get(tid, None)
+            if orig_int is None or pd.isna(orig_int):
+                continue
+            if assigned_bin < orig_int:
+                occ_count = int(locked[locked['task_id'] == tid].shape[0])
+                early_slack = float(orig_int - assigned_bin)
+                opportunity_cost += early_slack * occ_count * params.revenue_per_hour
+
+    line_tasks_df = tasks_df[(tasks_df['category'] == 1)].copy()
+    if not line_tasks_df.empty:
+        packaged_ids = set(locked['task_id'].astype(str).unique()) if (locked is not None and not locked.empty) else set()
+        remaining_line = line_tasks_df[~line_tasks_df['task_id'].astype(str).isin(packaged_ids)].copy()
+        if not remaining_line.empty:
+            occ = np.ceil(H / remaining_line['interval_fh'].to_numpy(dtype=float))
+            mh = remaining_line['manhours'].to_numpy(dtype=float)
+            men = np.where(remaining_line['men'].to_numpy(dtype=float) > 0, remaining_line['men'].to_numpy(dtype=float), 1.0)
+            occ_lab = params.phi * params.labor_rate * mh
+            occ_downtime = (mh / men) * params.revenue_per_hour
+            occ_overhead = params.ohL
+            line_cost = float((occ * (occ_lab + occ_downtime + occ_overhead)).sum())
+
+    total_cost = direct + material + overhead_total + downtime_total + line_cost + opportunity_cost
+    avg_cost_per_fh = total_cost / H if H > 0 else float('inf')
+
+    return {
+        'total_mh': total_mh,
+        'direct': direct,
+        'material': material,
+        'overhead': overhead_total,
+        'downtime': downtime_total,
+        'line_cost': line_cost,
+        'opportunity_cost': opportunity_cost,
+        'total': total_cost,
+        'avg_cost_per_fh': avg_cost_per_fh
+    }
+
+
+# ---------------------------
+# MILP builder & solve for a single (A,C,mode) using Pyomo
+# ---------------------------
+def solve_milp_for_pair(tasks_df: pd.DataFrame,
+                        candidates_df: pd.DataFrame,
+                        params: Params,
+                        A: int,
+                        C: int,
+                        H: int,
+                        Wpeak: float = 40.0,
+                        open_cost_A: float = None,
+                        open_cost_C: float = None,
+                        downtime_proxy_coeff: float = None,
+                        solver_options: Dict = None) -> Dict:
+    """
+    Build and solve a Pyomo MILP for a single (A,C) pair.
+    - tasks_df: canonical task info (task_id, interval_fh, manhours, men, category)
+    - candidates_df: output from map_task_occurrences_to_bins for that (A,C,mode)
+    - params: Params dataclass with cost parameters
+    - Wpeak: peak manhours allowed in a bin (operator parameter)
+    - open_cost_A / open_cost_C: per-bin open cost (if None, use params.ohA and params.ohC as proxies)
+    - downtime_proxy_coeff: linear coefficient to approximate downtime/opportunity proportional to package MH.
+       If None, we set downtime_proxy_coeff = params.revenue_per_hour / max(avg_men, 1.0)
+       This is only a linear proxy in the MILP objective; final exact downtime is recomputed using baseline function.
+    Returns dictionary with:
+        'model', 'status', 'assignment_locked_df' (locked occurrences produced from MILP assignment),
+        'exact_costs' (from baseline compute_costs_from_locked), 'surrogate_obj' (model objective)
+    """
+    # 1) Prepare open_cost and proxy
+    open_cost_A = open_cost_A if open_cost_A is not None else params.ohA
+    open_cost_C = open_cost_C if open_cost_C is not None else params.ohC
+    # estimate avg_men for proxy (avoid divide by zero)
+    avg_men = max(1.0, tasks_df['men'].replace(0, np.nan).dropna().mean() if not tasks_df['men'].replace(0, np.nan).dropna().empty else 1.0)
+    if downtime_proxy_coeff is None:
+        downtime_proxy_coeff = params.revenue_per_hour / avg_men
+
+    # 2) Build domain objects
+    # gather unique candidate bins from candidates_df (these are ints, FH)
+    if candidates_df is None or candidates_df.empty:
+        return {'status': 'no_candidates', 'assignment_locked_df': pd.DataFrame(), 'exact_costs': None, 'surrogate_obj': None}
+    candidate_bins = sorted(list(candidates_df['bin'].unique()))
+    task_ids = sorted(list(tasks_df['task_id'].astype(str).unique()))
+
+    # tasks that have no allowed bins -> they are line tasks and not included in x variables
+    allowed_pairs = list(candidates_df[['task_id', 'bin', 'mh']].itertuples(index=False, name=None))
+    # build mapping for allowed mh per (i,t)
+    allowed_mh = {(str(i), int(b)): float(m) for i, b, m in allowed_pairs}
+
+    # 3) Build Pyomo model
+    model = pyo.ConcreteModel()
+    model.TASKS = pyo.Set(initialize=task_ids)
+    model.BINS = pyo.Set(initialize=[str(b) for b in candidate_bins])  # use strings for pyomo keys
+    # helper mapping from string bin to int FH
+    bin_to_fh = {str(b): int(b) for b in candidate_bins}
+
+    # 3.1 Variables
+    # x[i,t] only for allowed pairs; we create full var and will constrain to 0 for disallowed pairs for simplicity
+    model.x = pyo.Var(model.TASKS, model.BINS, domain=pyo.Binary, initialize=0)
+    model.v = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
+
+    # 3.2 Constraints
+    # Assignment: for tasks that have at least one candidate bin, require sum_t x[i,t] == 1
+    # For tasks with no allowed bins, they are considered 'line' tasks (left unpackaged)
+    allowed_bins_by_task = {}
+    for tid in task_ids:
+        allowed = [str(b) for b in candidate_bins if (tid, int(b)) in allowed_mh]
+        allowed_bins_by_task[tid] = allowed
+
+    def assign_rule(m, i):
+        allowed = allowed_bins_by_task.get(i, [])
+        if len(allowed) == 0:
+            # no feasible package (line task): force all x[i,t] = 0 via equality 0==0
+            return sum(m.x[i, t] for t in m.BINS) == 0
+        else:
+            return sum(m.x[i, t] for t in allowed) == 1
+    model.assign_constr = pyo.Constraint(model.TASKS, rule=assign_rule)
+
+    # Capacity constraint per bin: sum mh_i * x[i,t] <= Wpeak * v[t]
+    def cap_rule(m, t):
+        fh = bin_to_fh[t]
+        return sum(allowed_mh.get((i, int(fh)), 0.0) * m.x[i, t] for i in m.TASKS) <= Wpeak * m.v[t]
+    model.cap_constr = pyo.Constraint(model.BINS, rule=cap_rule)
+
+    # Link: x <= v
+    def link_rule(m, i, t):
+        return m.x[i, t] <= m.v[t]
+    model.link_constr = pyo.Constraint(model.TASKS, model.BINS, rule=link_rule)
+
+    # Optional: you may add symmetry-breaking or ordering constraints (not required)
+    # For example, require first opened bin to be earliest in FH (not added now to keep model simple)
+
+    # 4) Objective: linear surrogate consistent with baseline incentives
+    #   surrogate_obj = open_cost (sum bins) + direct_labor*phi + material + downtime_proxy * total_mh
+    # note: direct labor and material are linear in MH; downtime proxy linear in MH with coeff downtime_proxy_coeff
+    def surrogate_obj_rule(m):
+        # open cost per bin use: choose A or C open cost depending on bin FH multiple
+        open_cost_sum = 0
+        for t in m.BINS:
+            fh = bin_to_fh[t]
+            is_c = (fh % C == 0)
+            oc = open_cost_C if is_c else open_cost_A
+            open_cost_sum += oc * m.v[t]
+        # total MH assigned linear:
+        total_mh_expr = sum(allowed_mh.get((i, int(bin_to_fh[t])), 0.0) * m.x[i, t] for i in m.TASKS for t in m.BINS)
+        direct_lab = params.labor_rate * total_mh_expr
+        direct_cost = params.phi * direct_lab
+        material_cost = params.material_fraction * direct_lab
+        downtime_proxy = downtime_proxy_coeff * total_mh_expr
+        return open_cost_sum + direct_cost + material_cost + downtime_proxy
+
+    model.OBJ = pyo.Objective(rule=surrogate_obj_rule, sense=pyo.minimize)
+
+    # 5) Solve with Gurobi
+    opt = SolverFactory('gurobi')
+    # solver options if provided
+    if solver_options:
+        for k, v in solver_options.items():
+            opt.options[k] = v
+
+    # set a time limit optionally if solver_options does not include it
+    try:
+        results = opt.solve(model, tee=False)  # do not print solver log by default
+    except Exception as e:
+        return {'status': 'solver_error', 'error': str(e)}
+
+    # 6) Extract assignment: build locked occurrences (propagate chosen primary bin)
+    chosen_pairs = []
+    for i in model.TASKS:
+        for t in model.BINS:
+            val = pyo.value(model.x[i, t])
+            if val is not None and val > 0.5:
+                fh = bin_to_fh[t]
+                chosen_pairs.append((i, fh, allowed_mh.get((i, fh), 0.0)))
+
+    # Build locked occurrences by propagating multiples of the chosen bin for each task
+    locked_records = []
+    for (tid, fh, mh_val) in chosen_pairs:
+        if fh <= 0:
+            continue
+        multiples = np.arange(fh, H + 1, fh, dtype=int)
+        for d in multiples:
+            locked_records.append((str(tid), int(d), fh, float(mh_val), 'MILP-assigned', ('C' if fh % C == 0 else 'A'), 0.0))
+    locked_df = pd.DataFrame(locked_records, columns=['task_id', 'due', 'bin', 'mh', 'method', 'check_level', 'slack'])
+
+    # 7) Recompute exact baseline cost using compute_costs_from_locked
+    exact_costs = compute_costs_from_locked(locked_df, tasks_df, params, A, C, H)
+
+    # 8) Return results
+    status = 'ok' if pyo.value(model.OBJ) is not None else 'unknown'
+    return {
+        'status': status,
+        'model': model,
+        'surrogate_obj': pyo.value(model.OBJ),
+        'locked_df': locked_df,
+        'exact_costs': exact_costs,
+        'chosen_pairs': chosen_pairs,
+        'candidate_bins': candidate_bins
+    }
+
+
+# ---------------------------
+# Utility: build final task-to-bin matrix and package summary
+# ---------------------------
+def build_task_bin_matrix(locked_df: pd.DataFrame, tasks_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construct a matrix-like DataFrame: rows = TaskID (RowID or Task code), columns = package labels
+    Package label format: 'nA' or 'nC' where n = multiple number (bin // A or // C)
+    """
+    if locked_df is None or locked_df.empty:
+        return pd.DataFrame()
+
+    # get first assigned bin only (primary package)
+    first_assigned = locked_df.groupby('task_id', as_index=False).agg({'bin': 'min'})
+    # map to label strings
+    labels = []
+    for _, r in first_assigned.iterrows():
+        b = int(r['bin'])
+        labels.append(str(b))
+    first_assigned['label'] = labels
+    tasks = list(first_assigned['task_id'].astype(str))
+    bins = sorted(first_assigned['label'].unique(), key=lambda x: int(x))
+
+    matrix = pd.DataFrame(0, index=tasks, columns=bins)
+    for _, r in first_assigned.iterrows():
+        matrix.at[str(r['task_id']), str(int(r['bin']))] = 1
+
+    # attach simple task info if available
+    try:
+        info = tasks_df.set_index('task_id')[['task_code', 'zone', 'category', 'manhours']]
+        # ensure index types match
+        info = info.reindex(matrix.index)
+        combined = pd.concat([info, matrix], axis=1)
+        return combined
+    except Exception:
+        return matrix
+
+
+def build_package_summary_from_locked(locked_df: pd.DataFrame, A: int, C: int, viz_horizon: int) -> pd.DataFrame:
+    # reuse baseline's logic (same as build_package_summary)
+    if locked_df is None or locked_df.empty:
+        return pd.DataFrame(columns=['assigned_level', 'assigned_bin', 'bin_start_fh', 'bin_end_fh', 'total_mh', 'task_count'])
+    df = locked_df.copy()
+    df = df.groupby(['task_id', 'bin', 'check_level'], as_index=False).agg(mh=('mh', 'sum'))
+    # aggregate per bin
+    agg = df.groupby(['check_level', 'bin'], as_index=False).agg(total_mh=('mh', 'sum'),
+                                                                 task_count=('task_id', 'nunique'))
+    rows = []
+    for _, r in agg.iterrows():
+        lvl = r['check_level']
+        b = int(r['bin'])
+        bin_size = A if lvl == 'A' else C
+        bin_start = max(1, b - bin_size + 1)
+        rows.append({
+            'assigned_level': lvl,
+            'assigned_bin': b,
+            'bin_start_fh': bin_start,
+            'bin_end_fh': b,
+            'total_mh': float(r['total_mh']),
+            'task_count': int(r['task_count'])
+        })
+    pkg_df = pd.DataFrame(rows)
+    pkg_df = pkg_df.sort_values('bin_end_fh').reset_index(drop=True)
+    # limit to viz horizon
+    pkg_df = pkg_df[pkg_df['bin_end_fh'] <= viz_horizon]
+    return pkg_df
+
+
+# ---------------------------
+# Plotting helpers (reuse baseline plotting style)
+# ---------------------------
+def plot_package_histogram(pkg_summary: pd.DataFrame, A: int, C: int, viz_horizon: int, savepath: Optional[str] = None):
+    plt.figure(figsize=(12, 5))
+    if pkg_summary is not None and not pkg_summary.empty:
+        x = pkg_summary['bin_end_fh']
+        heights = pkg_summary['total_mh']
+        widths = pkg_summary['assigned_level'].apply(lambda lvl: A * 0.6 if lvl == 'A' else C * 0.6)
+        plt.bar(x, heights, width=widths, align='center', edgecolor='k', alpha=0.7)
+    plt.xlabel('Flight Hours (FH)')
+    plt.ylabel('Total Manhours per Package (MH)')
+    plt.title(f'Workload Distribution (0–{viz_horizon} FH)')
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    if savepath:
+        plt.savefig(savepath, bbox_inches='tight', dpi=200)
+    plt.close()
+
+
+def plot_occurrence_histogram(locked: pd.DataFrame, viz_horizon: int, savepath: Optional[str] = None):
+    if locked is None or locked.empty:
+        return
+    df = locked[locked['due'] <= viz_horizon].copy()
+    occ = df.groupby('due', as_index=False)['mh'].sum().sort_values('due')
+    plt.figure(figsize=(14,6))
+    plt.bar(occ['due'], occ['mh'], width=max(1, int(viz_horizon/200)), align='center', edgecolor='k', alpha=0.8)
+    plt.xlabel('Flight Hours (FH)')
+    plt.ylabel('Total Manhours scheduled at this event (MH)')
+    plt.title(f'Package events up to {viz_horizon} FH')
+    plt.grid(axis='y', linestyle='--', alpha=0.4)
+    if savepath:
+        plt.savefig(savepath, bbox_inches='tight', dpi=200)
+    plt.close()
+
+
+# ---------------------------
+# Driver: run MILP for all A×C grid (mirrors baseline grid-search but with exact assignment)
+# ---------------------------
+def run_milp_grid(input_csv: str,
+                  A_candidates: List[int],
+                  C_candidates: List[int],
+                  params: Params,
+                  mode: str = 'equalized',
+                  H_override: Optional[int] = None,
+                  Wpeak: float = 40.0,
+                  viz_horizon: int = 50000,
+                  solver_options: Optional[Dict] = None,
+                  save_outputs: bool = True) -> Dict:
+    mpd = pd.read_csv(input_csv)
+    tasks_df = pd.DataFrame({
+        'task_id': mpd['RowID'].astype(str),
+        'task_code': mpd['TaskID'].astype(str),
+        'interval_fh': pd.to_numeric(mpd['IntervalFH'], errors='coerce'),
+        'manhours': pd.to_numeric(mpd['ManhoursRT'], errors='coerce'),
+        'men': pd.to_numeric(mpd['Men'], errors='coerce').fillna(0.0),
+        'category': pd.to_numeric(mpd['Categories'], errors='coerce').fillna(0).astype(int),
+        'zone': mpd['Zone'].astype(str)
+    })
+    tasks_df = tasks_df.dropna(subset=['interval_fh', 'manhours']).reset_index(drop=True)
+
+    H = H_override or params.H
+
+    best_exact = None
+    records = []
+
+    for A in A_candidates:
+        for C in C_candidates:
+            if C <= A:  # skip invalid configuration
+                continue
+
+            # build candidates exactly like baseline
+            candidates = map_task_occurrences_to_bins(tasks_df, A=A, C=C, H=H, mode=mode)
+            if candidates is None or candidates.empty:
+                # no candidates for this pair, skip
+                continue
+
+            # Build MILP and solve
+            res = solve_milp_for_pair(tasks_df=tasks_df, candidates_df=candidates,
+                                      params=params, A=A, C=C, H=H, Wpeak=Wpeak,
+                                      solver_options=solver_options)
+            if res.get('status') != 'ok':
+                # still record surrogate objective if available
+                records.append({'A': A, 'C': C, 'status': res.get('status'), 'surrogate_obj': res.get('surrogate_obj', None)})
+                continue
+
+            # res['exact_costs'] computed from baseline function for locked_df
+            exact = res['exact_costs']
+            records.append({'A': A, 'C': C, 'status': 'ok', 'surrogate_obj': res['surrogate_obj'], 'exact_total': exact['total'], 'avg_cost_per_fh': exact['avg_cost_per_fh']})
+
+            # track best by exact baseline cost (not surrogate)
+            if best_exact is None or exact['avg_cost_per_fh'] < best_exact['exact_costs']['avg_cost_per_fh']:
+                best_exact = {
+                    'A': A,
+                    'C': C,
+                    'candidates': candidates.copy(),
+                    'locked_df': res['locked_df'].copy(),
+                    'res': res,
+                    'exact_costs': exact
+                }
+
+    records_df = pd.DataFrame(records)
+    # Save cost summary if asked
+    if save_outputs:
+        if not records_df.empty:
+            records_df.to_csv("milp_cost_summary_all_combinations.csv", index=False)
+
+    return {'best': best_exact, 'records_df': records_df, 'tasks_df': tasks_df}
+
+
+# ---------------------------
+# CLI
+# ---------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--input', '-i', required=True, help="optimizer_input CSV (RowID, TaskID, IntervalFH, ManhoursRT, Men, Categories, Zone)")
+    p.add_argument('--A_min', type=int, default=400)
+    p.add_argument('--A_max', type=int, default=1000)
+    p.add_argument('--A_step', type=int, default=100)
+    p.add_argument('--C_min', type=int, default=4000)
+    p.add_argument('--C_max', type=int, default=9000)
+    p.add_argument('--C_step', type=int, default=1000)
+    p.add_argument('--mode', type=str, default='equalized', choices=['equalized', 'block'])
+    p.add_argument('--Wpeak', type=float, default=40.0, help="peak manhours capacity per package (manhour equivalent)")
+    p.add_argument('--viz_horizon', type=int, default=50000)
+    p.add_argument('--time_limit', type=int, default=300, help="solver time limit per MILP (s)")
+    p.add_argument('--save_outputs', action='store_true')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    params = Params()
+    A_candidates = list(range(args.A_min, args.A_max + 1, args.A_step))
+    C_candidates = list(range(args.C_min, args.C_max + 1, args.C_step))
+    solver_options = {'TimeLimit': args.time_limit, 'MIPGap': 0.01}  # example options
+
+    start = time.time()
+    print(f"[INFO] Running MILP grid: A candidates={A_candidates}, C candidates={C_candidates}, mode={args.mode}")
+    result = run_milp_grid(input_csv=args.input, A_candidates=A_candidates, C_candidates=C_candidates,
+                          params=params, mode=args.mode, H_override=None, Wpeak=args.Wpeak,
+                          viz_horizon=args.viz_horizon, solver_options=solver_options, save_outputs=args.save_outputs)
+
+    best = result['best']
+    if best is None:
+        print("[WARN] No feasible configuration found by MILP.")
+        return
+
+    # Extract final best
+    A_best = best['A']; C_best = best['C']
+    locked_best = best['locked_df']
+    tasks_df = result['tasks_df']
+    exact_costs = best['exact_costs']
+
+    print(f"[INFO] Best MILP configuration: A={A_best}, C={C_best}")
+    print("Exact baseline-cost decomposition for chosen solution:")
+    for k, v in exact_costs.items():
+        print(f"  {k}: {v}")
+
+    # Build validation DF and package summary using baseline helper logic
+    # compact validation uses tasks_df, candidates (from best) and locked
+    # Reuse baseline's build_compact_validation from earlier file; but we'll compute minimal fields here
+    validation_df = pd.DataFrame()
+    # Build package summary and matrix
+    pkg_summary = build_package_summary_from_locked(locked_best, A_best, C_best, args.viz_horizon)
+    task_bin_matrix = build_task_bin_matrix(locked_best, tasks_df)
+
+    # Save outputs & plots
+    tag = f"A{A_best}_C{C_best}_{args.mode}"
+    if args.save_outputs:
+        locked_best.to_csv(f"milp_locked_{tag}.csv", index=False)
+        pkg_summary.to_csv(f"milp_pkg_summary_{tag}.csv", index=False)
+        task_bin_matrix.to_csv(f"milp_task_bin_matrix_{tag}.csv", index=False)
+    plot_package_histogram(pkg_summary, A_best, C_best, args.viz_horizon, savepath=f"milp_pkg_hist_{tag}.png")
+    plot_occurrence_histogram(locked_best, args.viz_horizon, savepath=f"milp_occ_hist_{tag}.png")
+
+    elapsed = time.time() - start
+    print(f"[INFO] MILP grid completed in {elapsed:.1f}s. Outputs saved: {args.save_outputs}")
+    print("[INFO] Done.")
+
+
+if __name__ == "__main__":
+    main()
