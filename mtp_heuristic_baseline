@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""
+mtp_heuristic_baseline.py  (corrected, final)
+
+Fully integrated aircraft maintenance task packaging optimizer.
+- Takes optimizer_input CSV (RowID, TaskID, IntervalFH, ManhoursRT, Men, Categories, Zone)
+- Grid-search over A and C candidates; tests 'block' and 'equalized' modes per pair
+- Uses corrected slack/propagation rules:
+    slack = max(interval_fh - assigned_bin, 0)
+    occurrences = floor(H / assigned_bin)  (propagate at multiples of assigned_bin)
+- Restores full cost decomposition (direct, material, overhead A/C, downtime, line, opportunity)
+- Outputs:
+    - validation_best_A{A}_C{C}_{mode}.csv
+    - package_summary_best_A{A}_C{C}_{mode}.csv
+    - cost_summary_all_combinations.csv (all tested combos)
+    - package_hist_A{A}_C{C}_{mode}.png
+    - cumulative_A{A}_C{C}_{mode}.png
+"""
+
+import argparse
+import math
+import time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# Parameters dataclass
+# ---------------------------
+@dataclass
+class Params:
+    # productivity / labour multipliers
+    phi: float = 4/3
+    labor_rate: float = 25.0               # $ per MH
+    material_fraction: float = 0.33        # fraction of labour for materials
+    revenue_per_hour: float = 2000.0       # $ per aircraft FH lost (opportunity)
+    # overheads
+    ohA: float = 15000.0
+    ohC: float = 80000.0
+    ohL: float = 500.0
+    # downtime mapping
+    shift_hours: float = 8.0
+    mh_per_shift_A: float = 48.0
+    mh_per_shift_C: float = 90.0
+    # planning horizon default (can be overridden via CLI --H)
+    H: int = 180000
+
+
+# ---------------------------
+# Utility: generate global bins (A and C multiples)
+# ---------------------------
+def generate_bins(horizon: int, A: int, C: int) -> np.ndarray:
+    if A <= 0 or C <= 0:
+        raise ValueError("A and C must be positive integers.")
+    a_bins = np.arange(A, horizon + 1, A, dtype=int)
+    c_bins = np.arange(C, horizon + 1, C, dtype=int)
+    bins = np.unique(np.concatenate([a_bins, c_bins]))
+    return bins
+
+
+# ---------------------------
+# Candidate mapping: block vs equalized
+# ---------------------------
+def map_task_occurrences_to_bins(tasks_df: pd.DataFrame, A: int, C: int, H: int, mode: str = 'equalized') -> pd.DataFrame:
+    """
+    Produce candidate rows: for each task (and each due) propose candidate bin placements.
+    - Tasks with interval < A are NOT assigned (left for line handling).
+    - mode 'block': C-level tasks are assigned atomically to C-multiples (preferred),
+      falling back to nearest previous package if no C multiple <= due (rare).
+    - mode 'equalized': C-level tasks' MH are distributed evenly across A-bins within the C-window (d-C, d].
+    Includes adaptive A-package stop rule: A-bins cannot be assigned beyond the next C multiple boundary.
+    Returns DataFrame with columns: task_id, due, bin, mh, method, check_level, slack, category
+    Columns: task_id, due, bin, mh, method, check_level, slack, category
+    Slack is computed as interval - candidate_bin (task-level pull-forward).
+    """
+    records = []
+    bins = generate_bins(H, A, C)
+
+    for _, row in tasks_df.iterrows():
+        tid = str(row['task_id'])
+        interval = float(row['interval_fh'])
+        mh = float(row['manhours'])
+        cat = int(row.get('category', 0))
+
+        # leave tasks with interval < A as line candidates (no package candidates)
+        if interval < A or interval <= 0:
+            continue
+
+        # number of natural dues in horizon (not used for final occurrence, only to enumerate candidate mapping)
+        kmax = int(math.floor(H / interval))
+        if kmax <= 0:
+            continue
+        dues = (np.arange(1, kmax + 1) * interval).astype(int)
+
+        if interval < C:
+            # A-level tasks: candidate -> nearest earlier A-multiple
+            for d in dues:
+                valid_bins = bins[bins <= d]
+                if valid_bins.size == 0:
+                    continue
+                # pick the nearest A multiple <= due
+                a_cands = valid_bins[valid_bins % A == 0]
+                if a_cands.size == 0:
+                    continue
+                chosen_bin = int(a_cands[-1])   # prefer A multiple
+
+                # --- Adaptive A-package stop rule ---
+                next_C_multiple = math.ceil(chosen_bin / C) * C
+                if chosen_bin > next_C_multiple:
+                    # skip A-bins that fall beyond their next C boundary
+                    continue
+
+                slack = max(interval - chosen_bin, 0.0)
+                records.append((tid, int(d), chosen_bin, float(mh), 'A-assign', 'A', slack, cat))
+        else:
+            # C-level tasks
+            if mode == 'block':
+                # whole task assigned atomically to C-multiple
+                for d in dues:
+                    c_cands = bins[(bins <= d) & (bins % C == 0)]
+                    if c_cands.size > 0:
+                        chosen_bin = int(c_cands[-1])
+                    else:
+                        valid_bins = bins[bins <= d]
+                        if valid_bins.size == 0:
+                            continue
+                        chosen_bin = int(valid_bins[-1])
+                    slack = max(interval - chosen_bin, 0.0)
+                    records.append((tid, int(d), chosen_bin, float(mh), 'C-block', 'C', slack, cat))
+            else:
+                # equalized: split MH across A-multiples inside C-window (d-C, d]
+                for d in dues:
+                    window_start = max(0, d - C)
+                    first_a = ((window_start // A) + 1) * A
+                    a_list = np.arange(first_a, d + 1, A, dtype=int)
+                    a_list = a_list[a_list >= A]
+                    if a_list.size == 0:
+                        # fallback: assign to earlier C multiple
+                        c_cands = bins[(bins <= d) & (bins % C == 0)]
+                        if c_cands.size == 0:
+                            continue
+                        chosen_bin = int(c_cands[-1])
+                        slack = max(interval - chosen_bin, 0.0)
+                        records.append((tid, int(d), chosen_bin, float(mh), 'C-eq-fallback', 'C', slack, cat))
+                    else:
+                        per_mh = float(mh / a_list.size)
+                        for a_bin in a_list:
+                            # --- Adaptive A-package stop rule (for equalized case) ---
+                            next_C_multiple = math.ceil(a_bin / C) * C
+                            if a_bin > next_C_multiple:
+                                continue  # skip A-bins beyond next C boundary
+
+                            slack = max(interval - a_bin, 0.0)
+                            records.append((tid, int(d), int(a_bin), per_mh, 'C-eq', 'C', slack, cat))
+
+    cols = ['task_id', 'due', 'bin', 'mh', 'method', 'check_level', 'slack', 'category']
+    if not records:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(records, columns=cols)
+    # group identical rows (safety)
+    df = df.groupby(['task_id', 'due', 'bin', 'method', 'check_level', 'slack', 'category'], as_index=False)['mh'].sum()
+    return df
+
+
+# ---------------------------
+# Lock & propagate: pick one bin per task, propagate at multiples of chosen_bin
+# ---------------------------
+def lock_and_propagate(candidates: pd.DataFrame, tasks_df: pd.DataFrame, A: int, C: int, H: int, choose: str = 'min_slack') -> pd.DataFrame:
+    """
+    From candidate rows choose a single assigned_bin per task (prefer smallest slack),
+    then propagate occurrences at multiples of chosen_bin up to horizon H.
+    Returns locked occurrences: task_id, due, bin, mh, method, check_level, slack
+    """
+    if candidates is None or candidates.empty:
+        return pd.DataFrame(columns=['task_id', 'due', 'bin', 'mh', 'method', 'check_level', 'slack'])
+
+    candidates = candidates.copy()
+    candidates['bin'] = candidates['bin'].astype(int)
+
+    mh_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['manhours'].astype(float)))
+
+    locked_records = []
+    grouped = candidates.groupby('task_id')
+    for task_id, group in grouped:
+        orig_interval = None
+        try:
+            orig_interval = float(tasks_df.loc[tasks_df['task_id'].astype(str) == str(task_id), 'interval_fh'].iloc[0])
+        except Exception:
+            orig_interval = None
+
+        # Prefer candidates with bin <= orig_interval (pull-forward). If any exist, restrict to them.
+        selectable = group
+        if orig_interval is not None and not pd.isna(orig_interval):
+            leq = group[group['bin'] <= int(orig_interval)]
+            if not leq.empty:
+                selectable = leq
+
+        # choose by min slack among selectable
+        row = selectable.loc[selectable['slack'].idxmin()]
+        chosen_bin = int(row['bin'])
+        method = row.get('method', 'locked')
+        check_level = row.get('check_level', 'A')
+        mh_per_occ = mh_map.get(str(task_id), float(row['mh']))
+        if mh_per_occ is None or (isinstance(mh_per_occ, float) and math.isnan(mh_per_occ)):
+            mh_per_occ = float(row['mh'])
+
+        # PROPAGATE at multiples of chosen_bin (correct behavior)
+        if chosen_bin <= 0:
+            continue
+        multiples = np.arange(chosen_bin, H + 1, chosen_bin, dtype=int)
+        for d in multiples:
+            locked_records.append((str(task_id), int(d), chosen_bin, float(mh_per_occ), method, check_level, 0.0))
+
+    locked = pd.DataFrame(locked_records, columns=['task_id', 'due', 'bin', 'mh', 'method', 'check_level', 'slack'])
+    if not locked.empty:
+        locked = locked.groupby(['task_id', 'due', 'bin', 'method', 'check_level', 'slack'], as_index=False)['mh'].sum()
+    return locked
+
+
+# ---------------------------
+# Greedy unpackage for line-category tasks (category==1)
+# ---------------------------
+def greedy_unpackage_line_tasks(locked_df: pd.DataFrame,
+                                tasks_df: pd.DataFrame,
+                                params: Params,
+                                A: int,
+                                C: int,
+                                H: int) -> pd.DataFrame:
+    """
+    For each packaged task with category==1, test whether removing it (leaving it as a line task)
+    reduces total cost. If yes, permanently remove it from the locked assignments.
+
+    Greedy procedure:
+      - Start from baseline packaged state.
+      - Test one packaged line task at a time.
+      - If removing it decreases total cost, keep it unpackaged.
+      - Iterate until no further improvement.
+
+    Returns the new locked assignments (with some category==1 tasks removed).
+    """
+
+    if locked_df is None or locked_df.empty:
+        return locked_df.copy()
+
+    # --- SAFETY FILTER: remove tasks with invalid or zero intervals ---
+    tasks_df = tasks_df[tasks_df['interval_fh'] > 0].copy()
+
+    locked = locked_df.copy()
+    # baseline cost
+    base_costs = compute_costs_from_locked(locked, tasks_df, params, A, C, H)
+    base_total = base_costs['total']
+
+    # candidate packaged line tasks
+    packaged_ids = set(locked['task_id'].astype(str).unique())
+    line_candidates = tasks_df[(tasks_df['category'] == 1) &
+                               (tasks_df['task_id'].astype(str).isin(packaged_ids))].copy()
+
+    if line_candidates.empty:
+        return locked
+
+    # heuristic impact estimate: higher MH × labor_rate means higher potential impact
+    line_candidates['approx_impact'] = line_candidates['manhours'] * params.labor_rate
+    line_candidates = line_candidates.sort_values('approx_impact', ascending=False)
+
+    improved = True
+    iteration = 0
+    max_iter = 3  # prevent excessive recomputations
+    while improved and iteration < max_iter:
+        improved = False
+        iteration += 1
+        for _, row in line_candidates.iterrows():
+            tid = str(row['task_id'])
+            test_locked = locked[locked['task_id'].astype(str) != tid].copy()
+            test_costs = compute_costs_from_locked(test_locked, tasks_df, params, A, C, H)
+            if test_costs['total'] < base_total - 1e-6:  # small tolerance
+                locked = test_locked
+                base_total = test_costs['total']
+                line_candidates = line_candidates[line_candidates['task_id'].astype(str) != tid]
+                improved = True
+                print(f"[INFO] Unpackaged line task {tid} (iteration {iteration}) -> cost improved to {base_total:.2f}")
+                break  # restart loop with updated state
+    return locked
+
+
+# ---------------------------
+# Compact validation (one row per task)
+# ---------------------------
+def build_compact_validation(tasks_df: pd.DataFrame, candidates: pd.DataFrame, locked: pd.DataFrame, chosen_mode: str, A: int, C: int, H: int) -> pd.DataFrame:
+    """
+    Result columns (one row per task):
+      task_id, task_code, zone, category, men, interval_fh, manhours,
+      assigned_level, assigned_bin, occurrence_count, mh_per_occ,
+      task_package (first label), candidate_min_slack, chosen_mode
+    """
+    td = tasks_df.copy()
+    td['task_id'] = td['task_id'].astype(str)
+
+    # occurrence / assigned info from locked
+    if locked is None or locked.empty:
+        occ_df = pd.DataFrame(columns=['task_id', 'occurrence_count', 'assigned_bin', 'assigned_level', 'mh_per_occ'])
+    else:
+        occ = locked.groupby('task_id').agg(
+            occurrence_count=('due', 'count'),
+            assigned_bin=('bin', 'first'),
+            assigned_level=('check_level', 'first'),
+            mh_per_occ=('mh', 'mean')
+        ).reset_index()
+        occ_df = occ
+
+    # candidate_min_slack per task
+    if candidates is None or candidates.empty:
+        cand_df = pd.DataFrame(columns=['task_id', 'candidate_min_slack'])
+    else:
+        cand_df = candidates.groupby('task_id', as_index=False).agg(candidate_min_slack=('slack', 'min'))
+
+    # merge
+    val = td.merge(occ_df, on='task_id', how='left').merge(cand_df, on='task_id', how='left')
+
+    # compute task_package (single label from assigned_bin)
+    def compute_task_package(row):
+        b = row.get('assigned_bin', None)
+        lvl = row.get('assigned_level', None)
+        if pd.isna(b) or b is None or pd.isna(lvl) or lvl is None:
+            return None
+        b = int(b)
+        if lvl == 'C':
+            return f"{b // C}C"
+        else:
+            return f"{b // A}A"
+
+    val['task_package'] = val.apply(compute_task_package, axis=1)
+    val['chosen_mode'] = chosen_mode
+
+    # fill default values
+    val['occurrence_count'] = val['occurrence_count'].fillna(0).astype(int)
+    val['mh_per_occ'] = val['mh_per_occ'].fillna(0.0)
+    val['candidate_min_slack'] = val['candidate_min_slack'].fillna(0.0)
+    # --- NEW LOGIC: mark unpackaged category==1 tasks as "Line" ---
+    # These are line tasks that were not assigned to any package
+    mask_line = (val['category'] == 1) & (val['occurrence_count'] == 0)
+    val.loc[mask_line, 'assigned_level'] = 'Line'
+    val.loc[mask_line, 'assigned_bin'] = None
+
+    # select columns
+    cols = ['task_id', 'task_code', 'zone', 'category', 'men', 'interval_fh', 'manhours',
+            'assigned_level', 'assigned_bin', 'occurrence_count', 'mh_per_occ',
+            'task_package', 'candidate_min_slack', 'chosen_mode']
+    existing = [c for c in cols if c in val.columns]
+    return val[existing]
+
+
+# ---------------------------
+# Build package summary aggregated by bin (up to viz horizon)
+# ---------------------------
+def build_package_summary(compact_val: pd.DataFrame, A: int, C: int, viz_horizon: int) -> pd.DataFrame:
+    if compact_val is None or compact_val.empty:
+        return pd.DataFrame(columns=['assigned_level', 'assigned_bin', 'bin_start_fh', 'bin_end_fh', 'total_mh', 'task_count'])
+    df = compact_val.copy()
+    df = df[df['occurrence_count'] > 0].copy()
+    # total mh in viz horizon: mh_per_occ * min(occurrence_count, occ_up_to_viz)
+    def occ_within_viz(row):
+        b = row['assigned_bin']
+        if pd.isna(b):
+            return 0
+        b = int(b)
+        # occurrences at multiples of assigned_bin up to viz_horizon
+        occs = viz_horizon // b
+        return int(min(occs, int(row['occurrence_count'])))
+    df['occ_within_viz'] = df.apply(occ_within_viz, axis=1)
+    df['mh_in_viz'] = df['occ_within_viz'] * df['mh_per_occ']
+
+    agg = df.groupby(['assigned_level', 'assigned_bin'], as_index=False).agg(total_mh=('mh_in_viz', 'sum'),
+                                                                              task_count=('task_id', 'nunique'))
+    rows = []
+    for _, r in agg.iterrows():
+        lvl = r['assigned_level']
+        b = int(r['assigned_bin'])
+        bin_size = A if lvl == 'A' else C
+        bin_start = max(1, b - bin_size + 1)
+        rows.append({
+            'assigned_level': lvl,
+            'assigned_bin': b,
+            'bin_start_fh': bin_start,
+            'bin_end_fh': b,
+            'total_mh': float(r['total_mh']),
+            'task_count': int(r['task_count'])
+        })
+    pkg_df = pd.DataFrame(rows)
+    pkg_df = pkg_df.sort_values('bin_end_fh').reset_index(drop=True)
+    return pkg_df
+
+
+# ---------------------------
+# Cost computation (full decomposition)
+# ---------------------------
+def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, params: Params, A: int, C: int, H: int) -> Dict[str, float]:
+    """
+    Compute:
+      - direct (labor * phi)
+      - material (fraction of labor)
+      - overhead (per bin A or C)
+      - downtime (per bin using men or shifts fallback)
+      - line_cost (category==1 tasks left unpackaged)
+      - opportunity_cost (early pull-forward computed per-task using locked occurrences)
+    """
+    total_mh = float(locked['mh'].sum()) if (locked is not None and not locked.empty) else 0.0
+    direct_labour = params.labor_rate * total_mh
+    direct = params.phi * direct_labour
+    material = params.material_fraction * direct_labour
+
+    overhead_total = 0.0
+    downtime_total = 0.0
+    opportunity_cost = 0.0
+    line_cost = 0.0
+
+    if locked is not None and not locked.empty:
+        # overhead and downtime per bin
+        men_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['men'].astype(float)))
+        df = locked.copy()
+        df['men'] = df['task_id'].map(men_map).fillna(0.0)
+        bin_summary = df.groupby('bin', as_index=False).agg(total_mh=('mh', 'sum'), total_men=('men', 'sum'))
+        bin_summary['is_c'] = bin_summary['bin'] % C == 0
+        bin_summary['overhead'] = bin_summary['is_c'].apply(lambda x: params.ohC if x else params.ohA)
+        overhead_total = float(bin_summary['overhead'].sum())
+
+        # downtime: total_mh / total_men * revenue_per_hour, fallback to shift estimate if total_men==0
+        def downtime_cost_calc(r):
+            if r['total_men'] > 0:
+                downtime_hours = float(r['total_mh']) / float(r['total_men'])
+                return downtime_hours * params.revenue_per_hour
+            else:
+                cap = params.mh_per_shift_C if r['is_c'] else params.mh_per_shift_A
+                shifts = math.ceil(float(r['total_mh']) / cap) if cap > 0 else 0
+                downtime_hours = shifts * params.shift_hours
+                return downtime_hours * params.revenue_per_hour
+        bin_summary['downtime_cost'] = bin_summary.apply(downtime_cost_calc, axis=1)
+        downtime_total = float(bin_summary['downtime_cost'].sum())
+
+        # opportunity cost: for each task, compare assigned_bin to original interval
+        orig_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['interval_fh'].astype(float)))
+        first_assigned = locked.groupby('task_id', as_index=False).agg({'bin': 'min'})
+        for _, r in first_assigned.iterrows():
+            tid = str(r['task_id'])
+            assigned_bin = int(r['bin'])
+            orig_int = orig_map.get(tid, None)
+            if orig_int is None or pd.isna(orig_int):
+                continue
+            if assigned_bin < orig_int:
+                # use number of occurrences from locked table for that task
+                occ_count = int(locked[locked['task_id'] == tid].shape[0])
+                early_slack = float(orig_int - assigned_bin)
+                opportunity_cost += early_slack * occ_count * params.revenue_per_hour
+
+    # line tasks not packaged (category==1)
+    line_tasks_df = tasks_df[(tasks_df['category'] == 1)].copy()
+    if not line_tasks_df.empty:
+        packaged_ids = set(locked['task_id'].astype(str).unique()) if (locked is not None and not locked.empty) else set()
+        remaining_line = line_tasks_df[~line_tasks_df['task_id'].astype(str).isin(packaged_ids)].copy()
+        if not remaining_line.empty:
+            occ = np.ceil(H / remaining_line['interval_fh'].to_numpy(dtype=float))
+            mh = remaining_line['manhours'].to_numpy(dtype=float)
+            men = np.where(remaining_line['men'].to_numpy(dtype=float) > 0, remaining_line['men'].to_numpy(dtype=float), 1.0)
+            occ_lab = params.phi * params.labor_rate * mh
+            occ_downtime = (mh / men) * params.revenue_per_hour
+            occ_overhead = params.ohL
+            line_cost = float((occ * (occ_lab + occ_downtime + occ_overhead)).sum())
+
+    total_cost = direct + material + overhead_total + downtime_total + line_cost + opportunity_cost
+    avg_cost_per_fh = total_cost / H if H > 0 else float('inf')
+
+    return {
+        'total_mh': total_mh,
+        'direct': direct,
+        'material': material,
+        'overhead': overhead_total,
+        'downtime': downtime_total,
+        'line_cost': line_cost,
+        'opportunity_cost': opportunity_cost,
+        'total': total_cost,
+        'avg_cost_per_fh': avg_cost_per_fh
+    }
+
+
+# ---------------------------
+# Plot helpers
+# ---------------------------
+def plot_package_histogram(pkg_summary: pd.DataFrame, A: int, C: int, viz_horizon: int, savepath: Optional[str] = None):
+    plt.figure(figsize=(12, 5))
+    if pkg_summary is not None and not pkg_summary.empty:
+        x = pkg_summary['bin_end_fh']
+        heights = pkg_summary['total_mh']
+        widths = pkg_summary['assigned_level'].apply(lambda lvl: A * 0.6 if lvl == 'A' else C * 0.6)
+        plt.bar(x, heights, width=widths, align='center', edgecolor='k', alpha=0.7)
+    plt.xlabel('Flight Hours (FH)')
+    plt.ylabel('Total Manhours per Package (MH)')
+    plt.title(f'Workload Distribution (0–{viz_horizon} FH)')
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    if savepath:
+        plt.savefig(savepath, bbox_inches='tight', dpi=200)
+    plt.close()
+
+
+def plot_cumulative(pkg_summary: pd.DataFrame, viz_horizon: int, savepath: Optional[str] = None):
+    if pkg_summary is None or pkg_summary.empty:
+        return
+    df = pkg_summary.sort_values('bin_end_fh').copy()
+    df['cum_mh'] = df['total_mh'].cumsum()
+    plt.figure(figsize=(10, 4))
+    plt.step(df['bin_end_fh'], df['cum_mh'], where='post')
+    plt.xlabel('Flight Hours (FH)')
+    plt.ylabel('Cumulative Manhours (MH)')
+    plt.title(f'Cumulative Workload up to {viz_horizon} FH')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    if savepath:
+        plt.savefig(savepath, bbox_inches='tight', dpi=200)
+    plt.close()
+
+
+def plot_occurrence_histogram(locked: pd.DataFrame, viz_horizon: int, savepath: Optional[str] = None):
+    """
+    Plot histogram of scheduled package events (locked occurrences).
+    Each bar is at 'due' (FH) with height total MH scheduled at that due.
+    """
+    if locked is None or locked.empty:
+        return
+    df = locked[locked['due'] <= viz_horizon].copy()
+    occ = df.groupby('due', as_index=False)['mh'].sum().sort_values('due')
+    plt.figure(figsize=(14,6))
+    plt.bar(occ['due'], occ['mh'], width=max(1, int(viz_horizon/200)), align='center', edgecolor='k', alpha=0.8)
+    plt.xlabel('Flight Hours (FH)')
+    plt.ylabel('Total Manhours scheduled at this event (MH)')
+    plt.title(f'Package events up to {viz_horizon} FH')
+    plt.grid(axis='y', linestyle='--', alpha=0.4)
+    if savepath:
+        plt.savefig(savepath, bbox_inches='tight', dpi=200)
+    plt.close()
+
+
+# ---------------------------
+# Grid search driver
+# ---------------------------
+def grid_search_input(input_csv: str,
+                      A_candidates: List[int],
+                      C_candidates: List[int],
+                      params: Params,
+                      chooser: str = 'min_slack',
+                      H_override: Optional[int] = None) -> Tuple[pd.DataFrame, Dict]:
+    mpd = pd.read_csv(input_csv)
+    required = ['RowID', 'TaskID', 'IntervalFH', 'ManhoursRT', 'Men', 'Categories', 'Zone']
+    missing = [c for c in required if c not in mpd.columns]
+    if missing:
+        raise ValueError(f"Input CSV missing columns: {missing}")
+
+    tasks_df = pd.DataFrame({
+        'task_id': mpd['RowID'].astype(str),
+        'task_code': mpd['TaskID'].astype(str),
+        'interval_fh': pd.to_numeric(mpd['IntervalFH'], errors='coerce'),
+        'manhours': pd.to_numeric(mpd['ManhoursRT'], errors='coerce'),
+        'men': pd.to_numeric(mpd['Men'], errors='coerce').fillna(0.0),
+        'category': pd.to_numeric(mpd['Categories'], errors='coerce').fillna(0).astype(int),
+        'zone': mpd['Zone'].astype(str)
+    })
+    tasks_df = tasks_df.dropna(subset=['interval_fh', 'manhours']).reset_index(drop=True)
+
+    H = H_override or params.H
+    rows = []
+    cost_rows = []
+    best_info = None
+
+    for A in A_candidates:
+        for C in C_candidates:
+            if C <= A:
+                continue
+            # evaluate both modes and pick best
+            best_mode_local = None
+            for mode_option in ['block', 'equalized']:
+                candidates = map_task_occurrences_to_bins(tasks_df, A=A, C=C, H=H, mode=mode_option)
+                locked = lock_and_propagate(candidates, tasks_df, A=A, C=C, H=H, choose=chooser)
+                # NEW: Greedy unpackage of category==1 tasks
+                locked = greedy_unpackage_line_tasks(locked, tasks_df, params, A, C, H)
+                unpackaged_count = len(set(tasks_df[(tasks_df['category'] == 1)]['task_id'].astype(str)) -
+                       set(locked['task_id'].astype(str)))
+                if unpackaged_count > 0:
+                    print(f"[INFO] {unpackaged_count} line tasks left unpackaged after greedy refinement.")
+
+                # Now compute costs after possible un-packaging
+                costs = compute_costs_from_locked(locked, tasks_df, params, A, C, H)
+
+                cost_rows.append({
+                    'A': A,
+                    'C': C,
+                    'mode': mode_option,
+                    'direct_cost': costs['direct'],
+                    'material_cost': costs['material'],
+                    'overhead_cost': costs['overhead'],
+                    'downtime_cost': costs['downtime'],
+                    'line_cost': costs['line_cost'],
+                    'opportunity_cost': costs['opportunity_cost'],
+                    'total_cost': costs['total'],
+                    'avg_cost_per_fh': costs['avg_cost_per_fh']
+                })
+
+                if best_mode_local is None or costs['avg_cost_per_fh'] < best_mode_local['costs']['avg_cost_per_fh']:
+                    best_mode_local = {
+                        'mode': mode_option,
+                        'assignments_locked': locked.copy() if locked is not None else locked,
+                        'assignments_candidates': candidates.copy() if candidates is not None else candidates,
+                        'costs': costs
+                    }
+
+            rows.append({
+                'A': A,
+                'C': C,
+                'best_mode': best_mode_local['mode'],
+                'avg_cost_per_fh': best_mode_local['costs']['avg_cost_per_fh'],
+                'total_cost': best_mode_local['costs']['total'],
+                'total_mh': best_mode_local['costs']['total_mh']
+            })
+
+            if best_info is None or best_mode_local['costs']['avg_cost_per_fh'] < best_info['avg_cost_per_fh']:
+                best_info = {
+                    'A': A,
+                    'C': C,
+                    'mode': best_mode_local['mode'],
+                    'assignments_locked': best_mode_local['assignments_locked'],
+                    'assignments_candidates': best_mode_local['assignments_candidates'],
+                    'avg_cost_per_fh': best_mode_local['costs']['avg_cost_per_fh'],
+                    'costs': best_mode_local['costs']
+                }
+
+    results_df = pd.DataFrame(rows).sort_values('avg_cost_per_fh').reset_index(drop=True)
+    cost_summary_df = pd.DataFrame(cost_rows)
+    return results_df, {'best': best_info, 'tasks_df': tasks_df, 'cost_summary_df': cost_summary_df}
+
+
+# ---------------------------
+# CLI and main
+# ---------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="MTP Heuristic Baseline v4 optimizer (final)")
+    p.add_argument('--input', '-i', required=True, help="path to optimizer_input CSV")
+    p.add_argument('--A_min', type=int, default=400)
+    p.add_argument('--A_max', type=int, default=1000)
+    p.add_argument('--A_step', type=int, default=100)
+    p.add_argument('--C_min', type=int, default=4000)
+    p.add_argument('--C_max', type=int, default=9000)
+    p.add_argument('--C_step', type=int, default=1000)
+    p.add_argument('--chooser', type=str, choices=['min_slack', 'earliest'], default='min_slack')
+    p.add_argument('--H', type=int, default=None, help="Planning horizon (FH) to override Params.H")
+    p.add_argument('--visual_horizon', type=int, default=50000)
+    p.add_argument('--save_validation', action='store_true')
+    p.add_argument('--save_package_summary', action='store_true')
+    p.add_argument('--save_cost_summary', action='store_true')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    params = Params()
+    A_candidates = list(range(args.A_min, args.A_max + 1, args.A_step))
+    C_candidates = list(range(args.C_min, args.C_max + 1, args.C_step))
+    H_override = args.H
+
+    start_time = time.time()
+    print(f"[INFO] Started optimization (A candidates: {A_candidates}, C candidates: {C_candidates})")
+
+    results_df, meta = grid_search_input(args.input, A_candidates, C_candidates, params, chooser=args.chooser, H_override=H_override)
+
+    best = meta['best']
+    tasks_df = meta['tasks_df']
+    cost_summary_df = meta['cost_summary_df']
+    if best is None:
+        print("[INFO] No feasible configuration found. Exiting.")
+        return
+
+    A_best = best['A']
+    C_best = best['C']
+    mode_best = best['mode']
+    avg_cost = best['avg_cost_per_fh']
+    print(f"[INFO] Best A={A_best}, C={C_best}, mode={mode_best}, avg_cost_per_fh={avg_cost:.6f}")
+
+    assignments_cand_best = best['assignments_candidates']
+    assignments_locked_best = best['assignments_locked']
+
+    validation_df = build_compact_validation(tasks_df, assignments_cand_best, assignments_locked_best, mode_best, A_best, C_best, H_override or params.H)
+    pkg_summary = build_package_summary(validation_df, A_best, C_best, args.visual_horizon)
+    # --- NEW: Count unpackaged Line tasks for reporting ---
+    line_task_count = validation_df.loc[
+        (validation_df['assigned_level'] == 'Line') &
+        (validation_df['category'] == 1)
+    ].shape[0]
+
+    print(f"[INFO] {line_task_count} Line tasks left unpackaged after optimization.")
+
+
+    tag = f"A{A_best}_C{C_best}_{mode_best}"
+    if args.save_validation:
+        validation_df.to_csv(f"validation_best_{tag}.csv", index=False)
+    if args.save_package_summary:
+        pkg_summary.to_csv(f"package_summary_best_{tag}.csv", index=False)
+    if args.save_cost_summary:
+        cost_summary_df.to_csv("cost_summary_all_combinations.csv", index=False)
+
+    # plots (always save)
+    hist_path = f"package_hist_{tag}.png"
+    cum_path = f"cumulative_{tag}.png"
+    plot_package_histogram(pkg_summary, A_best, C_best, args.visual_horizon, savepath=hist_path)
+    plot_cumulative(pkg_summary, args.visual_horizon, savepath=cum_path)
+    plot_occurrence_histogram(assignments_locked_best, args.visual_horizon, savepath=f"occurrence_hist_{tag}.png")
+
+    elapsed = time.time() - start_time
+    saved = []
+    if args.save_validation:
+        saved.append(f"validation_best_{tag}.csv")
+    if args.save_package_summary:
+        saved.append(f"package_summary_best_{tag}.csv")
+    if args.save_cost_summary:
+        saved.append("cost_summary_all_combinations.csv")
+    saved.append(hist_path)
+    saved.append(cum_path)
+    print(f"[INFO] Completed in {elapsed:.2f} s. Outputs saved: {', '.join(saved)}")
+
+
+if __name__ == '__main__':
+    main()
