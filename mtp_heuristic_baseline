@@ -1,5 +1,5 @@
 """
-mtp_heuristic_baseline_v4.py  (corrected, final)
+mtp_heuristic_baseline.py  (corrected, final)
 
 Fully integrated aircraft maintenance task packaging optimizer.
 - Takes optimizer_input CSV (RowID, TaskID, IntervalFH, ManhoursRT, Men, Categories, Zone)
@@ -198,9 +198,9 @@ def map_task_occurrences_to_bins(tasks_df: pd.DataFrame, A: int, C: int, H: int,
                         per_mh = float(mh / a_list.size)
                         for a_bin in a_list:
                             # --- Adaptive A-package stop rule (for equalized case) ---
-                            next_C_multiple = math.ceil(a_bin / C) * C
-                            if a_bin > next_C_multiple:
-                                continue  # skip A-bins beyond next C boundary
+                            # next_C_multiple = math.ceil(a_bin / C) * C
+                            # if a_bin > next_C_multiple:
+                            #    continue  # skip A-bins beyond next C boundary
 
                             slack = max(interval - a_bin, 0.0)
                             records.append((tid, int(d), int(a_bin), per_mh, 'C-eq', 'C', slack, cat))
