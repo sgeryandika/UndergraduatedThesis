@@ -11,6 +11,21 @@ Combines original lightweight GUI with:
 ✅ Optional Excel export
 ✅ “View optimizer_input.csv” button
 
+Enhanced MPD Preprocessing and Optimizer Frontend ( For Research-ready edition)
+-----------------------------------------------------------------------
+- Preserves original GUI variables & structure while adding:
+  * Config.json loading (defaults & script paths)
+  * Validation of user inputs prior to runs
+  * Output option toggles (validation, summary, plots)
+  * Progress bar + indeterminate mode during runs
+  * Thread-safe logging into GUI and a timestamped frontend_log.txt
+  * Buttons to view outputs (CSV/plots) directly
+  * Compare Results tool (Baseline vs MILP) producing quick plots
+  * Remember last session (config updates saved to config.json)
+  * Safer subprocess invocation, and graceful error handling
+- Designed to work with:
+  mtp_preprocessing.py, mtp_heuristic_baseline.py, mtp_milp_optimizer.py
+
 Requires:
  - mtp_preprocessing.py  (with progress_callback support)
  - mtp_heuristic_baseline.py
@@ -25,123 +40,188 @@ import threading
 import traceback
 import subprocess
 from pathlib import Path
+from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-# --- Import Preprocessing Module ---
+# Optional imports used by compare/preview helpers (only used when comparing)
 try:
-    from mtp_preprocessing import clean_mpd, export_to_excel
-except Exception as e:
-    clean_mpd = None
-    export_to_excel = None
-    import_error = e
-else:
-    import_error = None
+    import pandas as pd
+    import matplotlib.pyplot as plt
+except Exception:
+    pd = None
+    plt = None
 
-# --- Paths to Optimizers ---
-BASELINE_SCRIPT = Path("mtp_heuristic_baseline.py")
-MILP_SCRIPT = Path("mtp_milp_optimizer.py")
+# -------------------------
+# Helper: Config loader/updater
+# -------------------------
+def load_config(path="config.json"):
+    """Safely load JSON config; return {} on any failure."""
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[WARN] Could not read config.json: {e}", file=sys.stderr)
+            return {}
+    return {}
 
+def update_config(path="config.json", section_key=None, key=None, value=None):
+    """
+    Update a value in config.json safely. section_key is top-level key (e.g., 'defaults').
+    Use only for short writes (called when user chooses 'remember last session').
+    """
+    cfg = load_config(path)
+    if section_key is None:
+        # overwrite top-level if value is dict
+        if isinstance(value, dict):
+            cfg.update(value)
+        else:
+            raise ValueError("Must provide section_key when value is not a dict")
+    else:
+        if section_key not in cfg or not isinstance(cfg.get(section_key), dict):
+            cfg[section_key] = {}
+        cfg[section_key][key] = value
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[WARN] Failed to update config.json: {e}", file=sys.stderr)
 
+# -------------------------
+# Default config (fallbacks)
+# -------------------------
+CFG = load_config("config.json")
+PATHS = CFG.get("paths", {})
+DEFAULTS = CFG.get("defaults", {})
+OPT_PARAMS = CFG.get("optimizer_params", {})
+
+# -------------------------
+# Default script paths (allow override by config.json)
+# -------------------------
+DEFAULT_PREPROCESSING_SCRIPT = PATHS.get("preprocessing_script", "mtp_preprocessing.py")
+DEFAULT_BASELINE_SCRIPT = PATHS.get("heuristic_optimizer", "mtp_heuristic_baseline.py")
+DEFAULT_MILP_SCRIPT = PATHS.get("milp_optimizer", "mtp_milp_optimizer.py")
+
+# -------------------------
+# Main GUI App
+# -------------------------
 class MPDFrontend(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("MPD Preprocessing and Optimizer Frontend")
-        self.geometry("940x640")
+        self.title("MPD Preprocessing and Optimizer Frontend (Research Edition)")
+        self.geometry("980x720")
         self.resizable(True, True)
 
-        # Variables
-        self.mpd_path = tk.StringVar()
+        # -------------------------
+        # GUI-bound variables (preserve names from original)
+        # -------------------------
+        self.mpd_path = tk.StringVar(value=str(Path(DEFAULTS.get("default_input_dir", "")).resolve()) if DEFAULTS.get("default_input_dir") else "")
         self.conv_file = tk.StringVar()
         self.output_csv = tk.StringVar(value="Cleaned_MPD_Data.csv")
         self.output_xlsx = tk.StringVar(value="Cleaned_MPD_Data.xlsx")
-        self.output_dir = tk.StringVar(value="output")
-        self.fh_per_day = tk.StringVar(value="8")
-        self.fh_per_fc = tk.StringVar(value="1.5")
-        self.fh_per_mo = tk.StringVar(value="")  # empty means "auto"
+        self.output_dir = tk.StringVar(value=str(Path(DEFAULTS.get("default_output_dir", "output")).resolve()))
+        self.fh_per_day = tk.StringVar(value=str(DEFAULTS.get("FH_per_day", 8)))
+        self.fh_per_fc = tk.StringVar(value=str(DEFAULTS.get("FH_per_fc", 1.5)))
+        self.fh_per_mo = tk.StringVar(value="")  # optional
+
         self.use_conv_file = tk.BooleanVar(value=False)
         self.export_excel = tk.BooleanVar(value=False)
-        self.run_button = None
 
         # Optimizer params
-        self.A_min = tk.StringVar(value="400")
-        self.A_max = tk.StringVar(value="1000")
-        self.A_step = tk.StringVar(value="100")
-        self.C_min = tk.StringVar(value="4000")
-        self.C_max = tk.StringVar(value="9000")
-        self.C_step = tk.StringVar(value="1000")
-        self.H = tk.StringVar(value="24000")
+        self.A_min = tk.StringVar(value=str(DEFAULTS.get("A_min", 400)))
+        self.A_max = tk.StringVar(value=str(DEFAULTS.get("A_max", 1000)))
+        self.A_step = tk.StringVar(value=str(DEFAULTS.get("A_step", 100)))
+        self.C_min = tk.StringVar(value=str(DEFAULTS.get("C_min", 4000)))
+        self.C_max = tk.StringVar(value=str(DEFAULTS.get("C_max", 9000)))
+        self.C_step = tk.StringVar(value=str(DEFAULTS.get("C_step", 1000)))
+        self.H = tk.StringVar(value=str(DEFAULTS.get("H", 24000)))
 
+        # Output options
+        self.save_validation = tk.BooleanVar(value=True)
+        self.save_summary = tk.BooleanVar(value=True)
+        self.save_plots = tk.BooleanVar(value=False)
+        self.remember_last_session = tk.BooleanVar(value=CFG.get("frontend", {}).get("remember_last_session", True))
+        self.auto_open_plots = tk.BooleanVar(value=CFG.get("frontend", {}).get("auto_open_plots", False))
+
+        # Internal references
+        self._output_xlsx_entry = None
+        self._output_xlsx_btn = None
+        self._conv_entry = None
+        self.run_button = None
+
+        # Build UI
         self._build_ui()
 
-    # ----------------------------------------------------------
+        # Create output folder if missing
+        Path(self.output_dir.get() or "output").mkdir(parents=True, exist_ok=True)
+
+        # Initialize log file
+        self._ensure_logfile()
+
+        # Warn if critical scripts missing
+        self._warn_missing_scripts()
+
+    # -------------------------
+    # UI Construction
+    # -------------------------
     def _build_ui(self):
         padx, pady = 8, 6
 
-        # --- MPD File ---
+        # === Top - MPD selection ===
         frm_top = tk.Frame(self)
         frm_top.pack(fill=tk.X, padx=padx, pady=(pady, 2))
         tk.Label(frm_top, text="MPD Excel file:").grid(row=0, column=0, sticky=tk.W)
         tk.Entry(frm_top, textvariable=self.mpd_path, width=80).grid(row=0, column=1, padx=6)
         tk.Button(frm_top, text="Browse...", command=self.browse_mpd).grid(row=0, column=2)
 
-        # --- Conversion Inputs ---
+        # === Conversion settings ===
         frm_conv = tk.LabelFrame(self, text="Conversion (utilization) settings")
         frm_conv.pack(fill=tk.X, padx=padx, pady=(2, pady))
-        """
-        tk.Label(frm_conv, text="FH_per_day:").grid(row=0, column=0, sticky=tk.E)
-        tk.Entry(frm_conv, textvariable=self.fh_per_day, width=10).grid(row=0, column=1, sticky=tk.W)
-        tk.Label(frm_conv, text="FH_per_fc:").grid(row=0, column=2, sticky=tk.E)
-        tk.Entry(frm_conv, textvariable=self.fh_per_fc, width=10).grid(row=0, column=3, sticky=tk.W)
-        tk.Label(frm_conv, text="FH_per_mo (optional):").grid(row=0, column=4, sticky=tk.E)
-        tk.Entry(frm_conv, textvariable=self.fh_per_mo, width=10).grid(row=0, column=5, sticky=tk.W)
-        """
-        # Conversion file or manual overrides
-        tk.Checkbutton(frm_conv, text="Load from conversion JSON file", variable=self.use_conv_file, command=self._toggle_conv_file).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(4, 2))
 
+        tk.Checkbutton(frm_conv, text="Load from conversion JSON file", variable=self.use_conv_file, command=self._toggle_conv_file).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(4,2))
         tk.Label(frm_conv, text="Conversion JSON:").grid(row=1, column=0, sticky=tk.W)
         tk.Entry(frm_conv, textvariable=self.conv_file, width=58).grid(row=1, column=1)
         tk.Button(frm_conv, text="Browse...", command=self.browse_conv_file).grid(row=1, column=2)
 
-        # Manual overrides
         tk.Label(frm_conv, text="FH_per_day:").grid(row=2, column=0, sticky=tk.E)
-        tk.Entry(frm_conv, textvariable=self.fh_per_day, width=10).grid(row=2, column=1, sticky=tk.W)
-        tk.Label(frm_conv, text="FH_per_fc:").grid(row=2, column=1, padx=(120,0), sticky=tk.E)
-        tk.Entry(frm_conv, textvariable=self.fh_per_fc, width=8).grid(row=2, column=1, sticky=tk.W, padx=(200,0))
+        tk.Entry(frm_conv, textvariable=self.fh_per_day, width=12).grid(row=2, column=1, sticky=tk.W)
+        tk.Label(frm_conv, text="FH_per_fc:").grid(row=2, column=1, padx=(150,0), sticky=tk.E)
+        tk.Entry(frm_conv, textvariable=self.fh_per_fc, width=8).grid(row=2, column=1, sticky=tk.W, padx=(300,0))
 
         tk.Label(frm_conv, text="FH_per_mo (optional):").grid(row=3, column=0, sticky=tk.E, pady=(4,0))
         tk.Entry(frm_conv, textvariable=self.fh_per_mo, width=12).grid(row=3, column=1, sticky=tk.W, pady=(4,0))
-        tk.Label(frm_conv, text="(leave blank to use 30 * FH_per_day)").grid(row=3, column=1, sticky=tk.W, padx=(120,0), pady=(4,0))
+        tk.Label(frm_conv, text="(leave blank to use 30 * FH_per_day)").grid(row=3, column=1, sticky=tk.W, padx=(150,0), pady=(4,0))
 
-        # --- Output Folder ---
+        # === Output Folder & Excel export ===
         frm_out = tk.LabelFrame(self, text="Output Folder")
         frm_out.pack(fill=tk.X, padx=padx, pady=(2, pady))
         tk.Label(frm_out, text="Output directory:").grid(row=0, column=0, sticky=tk.W)
         tk.Entry(frm_out, textvariable=self.output_dir, width=70).grid(row=0, column=1, padx=6)
         tk.Button(frm_out, text="Browse...", command=self.choose_output_dir).grid(row=0, column=2)
-        tk.Checkbutton(frm_out, text="Export Excel", variable=self.export_excel).grid(row=1, column=0, columnspan=2, sticky=tk.W)
-        
-        # Output options
-        tk.Checkbutton(frm_out, text="Export to Excel (XLSX)", variable=self.export_excel, command=self._toggle_excel).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(6,0))
-        tk.Entry(frm_out, textvariable=self.output_xlsx, width=60, state=tk.DISABLED).grid(row=2, column=1, padx=6)
-        tk.Button(frm_out, text="Choose...", command=self.choose_output_xlsx, state=tk.DISABLED).grid(row=2, column=2)
+        tk.Checkbutton(frm_out, text="Export to Excel (XLSX)", variable=self.export_excel, command=self._toggle_excel).grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        self._output_xlsx_entry = tk.Entry(frm_out, textvariable=self.output_xlsx, width=60, state=tk.DISABLED)
+        self._output_xlsx_entry.grid(row=2, column=1, padx=6)
+        self._output_xlsx_btn = tk.Button(frm_out, text="Choose...", command=self.choose_output_xlsx, state=tk.DISABLED)
+        self._output_xlsx_btn.grid(row=2, column=2)
 
-        # --- Preprocessing Controls ---
+        # === Preprocessing Controls ===
         frm_ctrl = tk.Frame(self)
         frm_ctrl.pack(fill=tk.X, padx=padx, pady=(2, pady))
         tk.Button(frm_ctrl, text="Run Preprocessing", width=20, command=self.run_cleaning).pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(frm_ctrl, text="Open Output Folder", command=self.open_output_folder).pack(side=tk.LEFT, padx=4)
         tk.Button(frm_ctrl, text="Quit", command=self.quit).pack(side=tk.RIGHT, padx=4)
-        
-        # --- Optimizer Section ---
+
+        # === Optimizer Section ===
         frm_opt = tk.LabelFrame(self, text="Optimizer (Manual Launch)")
         frm_opt.pack(fill=tk.X, padx=padx, pady=6)
 
-        tk.Button(frm_opt, text="Run Baseline Optimizer", command=lambda: self.run_optimizer(BASELINE_SCRIPT, "BASELINE")).grid(row=0, column=0, padx=4, pady=6)
-        tk.Button(frm_opt, text="Run MILP Optimizer", command=lambda: self.run_optimizer(MILP_SCRIPT, "MILP")).grid(row=0, column=1, padx=4, pady=6)
+        # Buttons to run baseline / MILP (keeps original quick-launch layout)
+        tk.Button(frm_opt, text="Run Baseline Optimizer", command=lambda: self.run_optimizer(DEFAULT_BASELINE_SCRIPT, "BASELINE")).grid(row=0, column=0, padx=4, pady=6)
+        tk.Button(frm_opt, text="Run MILP Optimizer", command=lambda: self.run_optimizer(DEFAULT_MILP_SCRIPT, "MILP")).grid(row=0, column=1, padx=4, pady=6)
         tk.Button(frm_opt, text="View Optimizer Input", command=self.view_optimizer_input).grid(row=0, column=2, padx=4, pady=6)
 
-        # --- Interval Inputs ---
+        # Interval inputs (A/C)
         labels = [("A_min", self.A_min), ("A_max", self.A_max), ("A_step", self.A_step),
                   ("C_min", self.C_min), ("C_max", self.C_max), ("C_step", self.C_step)]
         for i, (lbl, var) in enumerate(labels):
@@ -151,7 +231,25 @@ class MPDFrontend(tk.Tk):
         tk.Label(frm_opt, text="Planning Horizon (H):").grid(row=3, column=0, sticky=tk.E)
         tk.Entry(frm_opt, textvariable=self.H, width=10).grid(row=3, column=1, sticky=tk.W)
 
-        # --- Progress and Log ---
+        # === Output options (new) ===
+        tk.Label(frm_opt, text="Output Options:").grid(row=4, column=0, sticky=tk.W, pady=(8,0))
+        tk.Checkbutton(frm_opt, text="Save Validation Table", variable=self.save_validation).grid(row=5, column=0, sticky=tk.W)
+        tk.Checkbutton(frm_opt, text="Save Package Summary", variable=self.save_summary).grid(row=5, column=1, sticky=tk.W)
+        tk.Checkbutton(frm_opt, text="Save Figures / Plots", variable=self.save_plots).grid(row=5, column=2, sticky=tk.W)
+
+        # === Result quick-view buttons (new) ===
+        tk.Button(frm_opt, text="View Package Summary", command=self.view_package_summary).grid(row=6, column=0, pady=(6,0))
+        tk.Button(frm_opt, text="View Validation Table", command=self.view_validation_table).grid(row=6, column=1, pady=(6,0))
+        tk.Button(frm_opt, text="Open Output Folder", command=self.open_output_folder).grid(row=6, column=2, pady=(6,0))
+
+        # === Comparison Tools (new) ===
+        tk.Button(frm_opt, text="Compare Baseline vs MILP", command=self.compare_results).grid(row=7, column=0, columnspan=3, pady=(8,0), sticky=tk.W+tk.E)
+
+        # === Remember & auto-open options ===
+        tk.Checkbutton(frm_opt, text="Remember last session", variable=self.remember_last_session).grid(row=8, column=0, sticky=tk.W, pady=(6,0))
+        tk.Checkbutton(frm_opt, text="Auto-open plots after run", variable=self.auto_open_plots).grid(row=8, column=1, sticky=tk.W, pady=(6,0))
+
+        # === Progress and Log ===
         frm_log = tk.LabelFrame(self, text="Status / Log")
         frm_log.pack(fill=tk.BOTH, expand=True, padx=padx, pady=(2, pady))
         self.progress = ttk.Progressbar(frm_log, orient="horizontal", mode="determinate", maximum=100)
@@ -159,42 +257,63 @@ class MPDFrontend(tk.Tk):
         self.txt_log = tk.Text(frm_log, height=18, state=tk.DISABLED)
         self.txt_log.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
 
-        # store references to widgets we need to enable/disable
-        self._output_xlsx_entry = frm_out.grid_slaves(row=2, column=1)[0]
-        self._output_xlsx_btn = frm_out.grid_slaves(row=2, column=2)[0]
+        # store references to widgets (if needed)
+        # converters
         self._conv_entry = frm_conv.grid_slaves(row=1, column=1)[0]
 
-        # initialize toggles
+        # initialize toggles & states
         self._toggle_conv_file()
         self._toggle_excel()
 
-        # If import error occurred, show a warning
-        if import_error is not None:
-            self.log(f"[WARN] Preprocessing module import failed: {import_error}")
-            self.log("Make sure mtp_preprocessing.py exists in the same folder and defines clean_mpd and export_to_excel.")
+    # -------------------------
+    # Logging helpers
+    # -------------------------
+    def _ensure_logfile(self):
+        """Create or ensure we can write to frontend_log.txt"""
+        try:
+            logp = Path("frontend_log.txt")
+            if not logp.exists():
+                with open(logp, "w", encoding="utf-8") as f:
+                    f.write(f"Frontend log created: {datetime.now().isoformat()}\n")
+        except Exception as e:
+            print(f"[WARN] Could not create frontend log: {e}", file=sys.stderr)
 
-
-    # ----------------------------------------------------------
     def log(self, msg):
+        """Thread-safe logging into GUI and append to file."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {msg}"
+        # GUI update must run on main thread
+        try:
+            self.after(0, self._append_log_line, line)
+        except Exception:
+            # fallback
+            self._append_log_line(line)
+
+        # append to file (best-effort)
+        try:
+            with open("frontend_log.txt", "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            print(f"[WARN] Failed to write frontend_log: {e}", file=sys.stderr)
+
+    def _append_log_line(self, line):
         self.txt_log.config(state=tk.NORMAL)
-        self.txt_log.insert(tk.END, msg + "\n")
+        self.txt_log.insert(tk.END, line + "\n")
         self.txt_log.see(tk.END)
         self.txt_log.config(state=tk.DISABLED)
 
-    # --- File Handling ---
+    # -------------------------
+    # File browsing helpers
+    # -------------------------
     def browse_mpd(self):
         p = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx;*.xls")])
-        if p: self.mpd_path.set(p)
+        if p:
+            self.mpd_path.set(p)
 
     def browse_conv_file(self):
         p = filedialog.askopenfilename(filetypes=[("JSON files", "*.json"), ("All files", "*")])
         if p:
             self.conv_file.set(p)
-
-    def choose_output_csv(self):
-        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
-        if p:
-            self.output_csv.set(p)
 
     def choose_output_xlsx(self):
         p = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files","*.xlsx")])
@@ -202,23 +321,11 @@ class MPDFrontend(tk.Tk):
             self.output_xlsx.set(p)
             self._output_xlsx_entry.config(state=tk.NORMAL)
 
-    def _toggle_conv_file(self):
-        if self.use_conv_file.get():
-            self._conv_entry.config(state=tk.NORMAL)
-        else:
-            self._conv_entry.config(state=tk.DISABLED)
-
-    def _toggle_excel(self):
-        if self.export_excel.get():
-            self._output_xlsx_entry.config(state=tk.NORMAL)
-            self._output_xlsx_btn.config(state=tk.NORMAL)
-        else:
-            self._output_xlsx_entry.config(state=tk.DISABLED)
-            self._output_xlsx_btn.config(state=tk.DISABLED)
-
     def choose_output_dir(self):
         p = filedialog.askdirectory()
-        if p: self.output_dir.set(p)
+        if p:
+            self.output_dir.set(p)
+            Path(p).mkdir(parents=True, exist_ok=True)
 
     def open_output_folder(self):
         out = Path(self.output_dir.get() or "output")
@@ -245,34 +352,72 @@ class MPDFrontend(tk.Tk):
         except Exception as e:
             self.log(f"[ERROR] Failed to open file: {e}")
 
-    # ----------------------------------------------------------
-    # Preprocessing logic
-    def run_cleaning(self):
-        if clean_mpd is None:
-            messagebox.showerror("Error", "mtp_preprocessing.py not found or invalid.")
+    # -------------------------
+    # Result viewers
+    # -------------------------
+    def view_package_summary(self):
+        path = Path(self.output_dir.get() or "output") / "package_summary.csv"
+        if not path.exists():
+            messagebox.showinfo("File not found", f"{path} not found.")
             return
+        try:
+            if sys.platform.startswith("win"): os.startfile(str(path))
+            elif sys.platform == "darwin": subprocess.run(["open", str(path)])
+            else: subprocess.run(["xdg-open", str(path)])
+            self.log(f"[INFO] Opened: {path}")
+        except Exception as e:
+            self.log(f"[ERROR] Failed to open package summary: {e}")
 
-        mpd_file = self.mpd_path.get().strip()
-        if not mpd_file:
+    def view_validation_table(self):
+        path = Path(self.output_dir.get() or "output") / "validation_table.csv"
+        if not path.exists():
+            messagebox.showinfo("File not found", f"{path} not found.")
+            return
+        try:
+            if sys.platform.startswith("win"): os.startfile(str(path))
+            elif sys.platform == "darwin": subprocess.run(["open", str(path)])
+            else: subprocess.run(["xdg-open", str(path)])
+            self.log(f"[INFO] Opened: {path}")
+        except Exception as e:
+            self.log(f"[ERROR] Failed to open validation table: {e}")
+
+    # -------------------------
+    # Small UI toggles
+    # -------------------------
+    def _toggle_conv_file(self):
+        if self.use_conv_file.get():
+            self._conv_entry.config(state=tk.NORMAL)
+        else:
+            self._conv_entry.config(state=tk.DISABLED)
+
+    def _toggle_excel(self):
+        if self.export_excel.get():
+            self._output_xlsx_entry.config(state=tk.NORMAL)
+            self._output_xlsx_btn.config(state=tk.NORMAL)
+        else:
+            self._output_xlsx_entry.config(state=tk.DISABLED)
+            self._output_xlsx_btn.config(state=tk.DISABLED)
+
+    # -------------------------
+    # Preprocessing runner
+    # -------------------------
+    def run_cleaning(self):
+        # Validate MPD selection
+        if not self.mpd_path.get().strip():
             messagebox.showwarning("Missing Input", "Please select an MPD Excel file.")
             return
 
+        # Ensure output directory
         output_dir = self.output_dir.get().strip() or "output"
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        out_csv = self.output_csv.get().strip() or "Cleaned_MPD_Data.csv"
-        out_xlsx = self.output_xlsx.get().strip() if self.export_excel.get() else None
 
-        # build conversion constants
-        fh_day = None
-        fh_fc = None
-        fh_mo = None
-
-        if self.use_conv_file.get():
-            conv_path = self.conv_file.get().strip()
-            if not conv_path:
-                messagebox.showwarning("Conversion file", "Please select a conversion JSON file or disable the checkbox.")
-                return
-            try:
+        # Parse conversion constants (safe)
+        try:
+            if self.use_conv_file.get():
+                conv_path = self.conv_file.get().strip()
+                if not conv_path:
+                    messagebox.showwarning("Conversion file", "Please select a conversion JSON file or disable the checkbox.")
+                    return
                 with open(conv_path, 'r', encoding='utf-8') as f:
                     conv = json.load(f)
                 fh_day = float(conv.get('FH_per_day', 8))
@@ -280,99 +425,350 @@ class MPDFrontend(tk.Tk):
                 fh_mo = conv.get('FH_per_mo')
                 if fh_mo is not None:
                     fh_mo = float(fh_mo)
-            except Exception as e:
-                messagebox.showerror("Conversion file error", f"Failed to read conversion file: {e}")
-                return
-        else:
-            # manual fields
-            try:
+            else:
                 fh_day = float(self.fh_per_day.get()) if self.fh_per_day.get().strip() else 8.0
                 fh_fc = float(self.fh_per_fc.get()) if self.fh_per_fc.get().strip() else 1.5
                 fh_mo = float(self.fh_per_mo.get()) if self.fh_per_mo.get().strip() else None
-            except Exception as e:
-                messagebox.showerror("Conversion value error", f"Invalid conversion numeric input: {e}")
-                return
+        except Exception as e:
+            messagebox.showerror("Conversion value error", f"Invalid conversion numeric input: {e}")
+            return
 
         self.progress["value"] = 0
         self.progress.config(mode="determinate")
-        self.log(f"[INFO] Starting preprocessing ({mpd_file})...")
-
-        def progress_callback(current, total):
-            pct = int((current / total) * 100)
-            self.progress["value"] = pct
-            self.update_idletasks()
+        self.log(f"[INFO] Starting preprocessing ({self.mpd_path.get()})...")
 
         def worker():
             try:
-                df, opt_path, total, valid = clean_mpd(
-                    mpd_file,
-                    output_dir=output_dir,
-                    FH_per_day=fh_day,
-                    FH_per_fc=fh_fc,
-                    FH_per_mo=fh_mo,
-                    progress_callback=progress_callback,
-                )
+                # Import preprocessing function dynamically (allows different script via config)
+                preprocessing_script = PATHS.get("preprocessing_script", DEFAULT_PREPROCESSING_SCRIPT)
+                # Attempt to import if module available in PYTHONPATH, else run subprocess
+                try:
+                    # local import attempt (preferred)
+                    module_name = Path(preprocessing_script).stem
+                    spec = None
+                    if module_name in sys.modules:
+                        mod = sys.modules[module_name]
+                    else:
+                        # Safe import: add current dir to sys.path
+                        sys.path.insert(0, str(Path(".").resolve()))
+                        mod = __import__(module_name)
+                    clean_mpd = getattr(mod, "clean_mpd", None)
+                    export_to_excel = getattr(mod, "export_to_excel", None)
+                except Exception:
+                    clean_mpd = None
+                    export_to_excel = None
 
-                if self.export_excel.get():
-                    export_to_excel(df, Path(output_dir) / "Cleaned_MPD_Data.xlsx")
-                self.progress["value"] = 100
-                self.log(f"[INFO] Preprocessing complete: {total} total, {valid} valid optimizer tasks.")
-                    
+                if clean_mpd is None:
+                    # Fallback: run preprocessing as a subprocess if script exists
+                    script_path = Path(preprocessing_script)
+                    if not script_path.exists():
+                        raise FileNotFoundError(f"Preprocessing script not found: {script_path}")
+                    # Build subprocess command (use same args as older frontend)
+                    cmd = [
+                        sys.executable, str(script_path),
+                        "--input", self.mpd_path.get(),
+                        "--output_dir", output_dir,
+                        "--FH_per_day", str(fh_day),
+                        "--FH_per_fc", str(fh_fc)
+                    ]
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    for line in iter(proc.stdout.readline, ''):
+                        if not line:
+                            break
+                        self.log(f"[PREP] {line.strip()}")
+                    proc.wait()
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"Preprocessing script exited with code {proc.returncode}")
+                    # assume subprocess produced optimizer_input.csv in output_dir
+                    # We cannot extract df, total, valid without direct import.
+                    self.log("[INFO] Preprocessing subprocess finished.")
+                else:
+                    # Call local function (signature expected: clean_mpd(mpd_file, output_dir=..., FH_per_day=..., FH_per_fc=..., FH_per_mo=..., progress_callback=...))
+                    def progress_callback(current, total):
+                        try:
+                            pct = int((current / total) * 100)
+                        except Exception:
+                            pct = 0
+                        self.progress["value"] = pct
+                        self.update_idletasks()
+
+                    df, opt_path, total, valid = clean_mpd(
+                        self.mpd_path.get(),
+                        output_dir=output_dir,
+                        FH_per_day=fh_day,
+                        FH_per_fc=fh_fc,
+                        FH_per_mo=fh_mo,
+                        progress_callback=progress_callback,
+                    )
+                    if self.export_excel.get() and export_to_excel:
+                        export_to_excel(df, Path(output_dir) / self.output_xlsx.get())
+                    self.progress["value"] = 100
+                    self.log(f"[INFO] Preprocessing complete: {total} total, {valid} valid optimizer tasks.")
             except Exception as e:
                 self.log(f"[ERROR] Preprocessing failed: {e}")
                 self.log(traceback.format_exc())
-                messagebox.showerror("Error", f"Preprocessing failed. See status for details.\n{e}")
-            
+                self.after(0, lambda: messagebox.showerror("Error", f"Preprocessing failed. See status for details.\n{e}"))
+            finally:
+                self.progress["value"] = 0
+                self.progress.config(mode="determinate")
+
         threading.Thread(target=worker, daemon=True).start()
 
-    # ----------------------------------------------------------
-    # Optimizer logic
-    def run_optimizer(self, script_path: Path, label: str):
+    # -------------------------
+    # Optimizer runner (Baseline or MILP)
+    # -------------------------
+    def run_optimizer(self, script_path: str, label: str):
+        """
+        Launches optimizer script_path with proper args, validates GUI inputs,
+        and logs output into GUI. This function supports both legacy flags
+        (--A_min etc.) and the new --config flag usage.
+        """
         input_file = Path(self.output_dir.get() or "output") / "optimizer_input.csv"
-        if not input_file.exists():
-            messagebox.showwarning("Missing Input", "Run preprocessing first to generate optimizer_input.csv.")
+        if not input_file.exists() or input_file.stat().st_size == 0:
+            messagebox.showwarning("Missing Input", "Run preprocessing first to generate optimizer_input.csv (non-empty).")
             return
+
+        script_path = Path(script_path)
+        if not script_path.exists():
+            # try resolve via config paths
+            alt = PATHS.get("milp_optimizer" if label == "MILP" else "heuristic_optimizer")
+            if alt:
+                script_path = Path(alt)
         if not script_path.exists():
             messagebox.showwarning("Missing Script", f"{script_path} not found.")
             return
 
+        # -------------------------
+        # Validate numeric GUI fields strictly
+        # -------------------------
+        def is_int_str(s):
+            try:
+                int(s)
+                return True
+            except Exception:
+                return False
+
+        required_fields = [
+            ("A_min", self.A_min.get()), ("A_max", self.A_max.get()), ("A_step", self.A_step.get()),
+            ("C_min", self.C_min.get()), ("C_max", self.C_max.get()), ("C_step", self.C_step.get()),
+            ("H", self.H.get())
+        ]
+        for name, val in required_fields:
+            if not val or not str(val).strip():
+                messagebox.showwarning("Missing Input", f"Please provide {name} before running optimizer.")
+                return
+            if name != "H" and not is_int_str(val.strip()):
+                messagebox.showwarning("Invalid Input", f"{name} must be an integer.")
+                return
+            # H should be integer too
+            if name == "H" and not is_int_str(val.strip()):
+                messagebox.showwarning("Invalid Input", "H (planning horizon) must be an integer.")
+                return
+
+        # -------------------------
+        # Build optional output flags based on user selections
+        # -------------------------
+        output_flags = []
+        if self.save_validation.get():
+            output_flags.append("--save_validation")
+        if self.save_summary.get():
+            output_flags.append("--save_package_summary")
+        if self.save_plots.get():
+            output_flags.append("--save_plots")
+        # Always pass config so optimizers pick up shared defaults
+        output_flags.append("--config")
+        output_flags.append("config.json")
+
+        output_flags_str = " ".join(output_flags)
+
+        # -------------------------
+        # Build command string (legacy range style kept for frontend)
+        # If you later prefer candidate lists you can convert ranges here.
+        # -------------------------
         cmd = (
-            f"python {shlex.quote(str(script_path))} "
+            f"{sys.executable} {shlex.quote(str(script_path))} "
             f"--input {shlex.quote(str(input_file))} "
             f"--A_min {self.A_min.get()} --A_max {self.A_max.get()} --A_step {self.A_step.get()} "
             f"--C_min {self.C_min.get()} --C_max {self.C_max.get()} --C_step {self.C_step.get()} "
             f"--H {self.H.get()} "
-            "--save_validation --save_package_summary"
+            f"{output_flags_str}"
         )
 
-        self.log(f"[INFO] Launching {label} optimizer...")
-        self.log(f"[INFO] Intervals: A={self.A_min.get()}–{self.A_max.get()} step {self.A_step.get()}, "
-                 f"C={self.C_min.get()}–{self.C_max.get()} step {self.C_step.get()}, H={self.H.get()}")
+        self.log(f"[INFO] Launching {label} optimizer: {script_path.name}")
+        self.log(f"[INFO] Command: {cmd}")
 
+        # Launch subprocess in thread and stream logs
         def worker():
             self.progress.config(mode="indeterminate")
             self.progress.start(15)
             try:
+                # Use shlex.split for safe arg list
                 proc = subprocess.Popen(shlex.split(cmd), shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                # stream stdout lines
                 for line in iter(proc.stdout.readline, ''):
                     if not line:
                         break
+                    # Prefix log line with label
                     self.log(f"[{label}] {line.strip()}")
                 proc.wait()
                 if proc.returncode == 0:
                     self.log(f"[INFO] {label} optimizer finished successfully.")
                 else:
                     self.log(f"[ERROR] {label} optimizer exited with code {proc.returncode}")
+                # Post-run behaviors
+                if self.save_plots.get() and self.auto_open_plots.get():
+                    # open output dir
+                    try:
+                        self.open_output_folder()
+                    except Exception:
+                        pass
+                # If user chose to remember session, save selected defaults
+                if self.remember_last_session.get():
+                    try:
+                        update_config("config.json", "defaults", "H", int(self.H.get()))
+                        update_config("config.json", "defaults", "A_min", int(self.A_min.get()))
+                        update_config("config.json", "defaults", "A_max", int(self.A_max.get()))
+                        update_config("config.json", "defaults", "A_step", int(self.A_step.get()))
+                        update_config("config.json", "defaults", "C_min", int(self.C_min.get()))
+                        update_config("config.json", "defaults", "C_max", int(self.C_max.get()))
+                        update_config("config.json", "defaults", "C_step", int(self.C_step.get()))
+                        # also frontend flags
+                        update_config("config.json", "frontend", "remember_last_session", bool(self.remember_last_session.get()))
+                        update_config("config.json", "frontend", "auto_open_plots", bool(self.auto_open_plots.get()))
+                    except Exception as e:
+                        self.log(f"[WARN] Failed to update config.json: {e}")
             except Exception as e:
                 self.log(f"[ERROR] {label} run failed: {e}")
                 self.log(traceback.format_exc())
             finally:
-                self.progress.stop()
-                self.progress.config(mode="determinate")
+                try:
+                    self.progress.stop()
+                    self.progress.config(mode="determinate")
+                    self.progress["value"] = 0
+                except Exception:
+                    pass
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # -------------------------
+    # Utility: check presence of optimizer scripts and warn
+    # -------------------------
+    def _warn_missing_scripts(self):
+        missing = []
+        for key, script in [("preprocessing", PATHS.get("preprocessing_script", DEFAULT_PREPROCESSING_SCRIPT)),
+                            ("baseline", PATHS.get("heuristic_optimizer", DEFAULT_BASELINE_SCRIPT)),
+                            ("milp", PATHS.get("milp_optimizer", DEFAULT_MILP_SCRIPT))]:
+            if not Path(script).exists():
+                missing.append((key, script))
+        if missing:
+            for k, s in missing:
+                self.log(f"[WARN] Script for {k} not found: {s}")
 
+    # -------------------------
+    # Comparison tool: Baseline vs MILP
+    # Reads expected package_summary files and shows a quick comparison plot.
+    # -------------------------
+    def compare_results(self):
+        """
+        Compare baseline vs milp package summaries:
+        - looks for package_summary_baseline.csv and package_summary_milp.csv
+        - if absent, try fallback names (package_summary.csv, milp_pkg_summary_A{A}_C{C}.csv)
+        - Displays a quick barplot (requires pandas & matplotlib)
+        """
+        if pd is None or plt is None:
+            messagebox.showwarning("Dependencies", "pandas and matplotlib are required for comparison plotting.")
+            return
+
+        outdir = Path(self.output_dir.get() or "output")
+        # candidate filenames
+        baseline_files = [
+            outdir / "baseline_package_summary.csv",
+            outdir / "package_summary_baseline.csv",
+            outdir / "package_summary_baseline_A.csv"
+        ]
+        milp_files = [
+            outdir / "milp_package_summary.csv",
+            outdir / "package_summary_milp.csv",
+            outdir / "milp_pkg_summary_A{A}_C{C}.csv"
+        ]
+
+        # Try to find baseline file
+        base_path = None
+        for p in baseline_files:
+            if p.exists():
+                base_path = p
+                break
+        # Try generic fallback
+        if base_path is None:
+            # try package_summary.csv (maybe baseline wrote it)
+            p = outdir / "package_summary.csv"
+            if p.exists():
+                base_path = p
+
+        milp_path = None
+        for p in milp_files:
+            if isinstance(p, Path) and p.exists():
+                milp_path = p
+                break
+        if milp_path is None:
+            # find any file starting with milp_pkg_summary
+            for f in outdir.glob("milp_pkg_summary*.csv"):
+                milp_path = f
+                break
+        # If no files found, notify
+        if base_path is None and milp_path is None:
+            messagebox.showinfo("No results", "No package_summary files found for Baseline or MILP in output folder.")
+            return
+
+        # Read whichever exists and compute total cost if available
+        def read_summary(p):
+            try:
+                df = pd.read_csv(p)
+                # attempt to find a cost column by name fallbacks
+                cost_col = None
+                for c in ['total_incurred', 'total_cost', 'TotalCost', 'total_with_opportunity', 'total']:
+                    if c in df.columns:
+                        cost_col = c
+                        break
+                total_cost = float(df[cost_col].sum()) if cost_col is not None else None
+                total_mh = df['total_mh'].sum() if 'total_mh' in df.columns else None
+                return {'path': p, 'df': df, 'total_cost': total_cost, 'total_mh': total_mh}
+            except Exception:
+                return {'path': p, 'df': None, 'total_cost': None, 'total_mh': None}
+
+        base_info = read_summary(base_path) if base_path else None
+        milp_info = read_summary(milp_path) if milp_path else None
+
+        # Build plot
+        labels = []
+        costs = []
+        if base_info:
+            labels.append("Baseline")
+            costs.append(base_info.get('total_cost') or 0.0)
+        if milp_info:
+            labels.append("MILP")
+            costs.append(milp_info.get('total_cost') or 0.0)
+
+        if not labels:
+            messagebox.showinfo("No usable data", "Found summary files but couldn't parse cost data to compare.")
+            return
+
+        # Simple barplot
+        try:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.bar(labels, costs)
+            ax.set_ylabel("Total Cost (USD)")
+            ax.set_title("Cost Comparison (Baseline vs MILP)")
+            for i, v in enumerate(costs):
+                ax.text(i, v + max(1.0, v*0.02), f"{v:,.0f}", ha='center')
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            messagebox.showerror("Plot Error", f"Failed to draw comparison plot: {e}")
+
+# -------------------------
+# Run app
+# -------------------------
 if __name__ == "__main__":
     app = MPDFrontend()
     app.mainloop()
