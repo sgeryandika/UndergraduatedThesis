@@ -1,5 +1,5 @@
 """
-mtp_heuristic_baseline.py  (corrected, final)
+mtp_heuristic_baseline_v4.py  (corrected, final)
 
 Fully integrated aircraft maintenance task packaging optimizer.
 - Takes optimizer_input CSV (RowID, TaskID, IntervalFH, ManhoursRT, Men, Categories, Zone)
@@ -14,7 +14,7 @@ Fully integrated aircraft maintenance task packaging optimizer.
     - cost_summary_all_combinations.csv (all tested combos)
     - package_hist_A{A}_C{C}_{mode}.png
     - cumulative_A{A}_C{C}_{mode}.png
-    - gantt event packages
+    - Gantt event visualization
 """
 
 import argparse
@@ -1441,26 +1441,26 @@ def main():
     mode_best = best['mode']
     avg_cost = best['avg_cost_per_fh']
 
-    print("\n[SUMMARY] --- OPTIMIZATION COMPLETE ---")
-    print(f"  Best A-check interval: {A_best}")
-    print(f"  Best C-check interval: {C_best}")
-    print(f"  Best mode: {mode_best}")
-    print(f"  Total cost (with opportunity): {best['costs']['total_with_opportunity']:.2f} $")
-    print(f"  Average cost per FH: {avg_cost:.6f}")
-    print("----------------------------------------\n")
-
     assignments_cand_best = best['assignments_candidates']
     assignments_locked_best = best['assignments_locked']
 
     validation_df = build_compact_validation(tasks_df, assignments_cand_best, assignments_locked_best, mode_best, A_best, C_best, H_override or params.H)
     pkg_summary = build_package_summary(validation_df, A_best, C_best, args.visual_horizon)
-    # --- NEW: Count unpackaged Line tasks for reporting ---
+    # --- Count unpackaged Line tasks for reporting ---
     line_task_count = validation_df.loc[
         (validation_df['assigned_level'] == 'Line') &
         (validation_df['category'] == 1)
     ].shape[0]
 
-    print(f"[INFO] {line_task_count} Line tasks left unpackaged after optimization.")
+    print("\n[SUMMARY] --- OPTIMIZATION COMPLETE ---")
+    print(f"  Best A-check interval: {A_best}")
+    print(f"  Best C-check interval: {C_best}")
+    print(f"  Best mode: {mode_best}")
+    print(f"  Total incurred cost: {best['costs']['total_incurred']:.2f} $")
+    print(f"  Total line task unpackaged: {line_task_count} tasks")
+    print(f"  Total cost (with opportunity): {best['costs']['total_with_opportunity']:.2f} $")
+    print(f"  Average cost per FH: {avg_cost:.6f}")
+    print("----------------------------------------\n")
 
     tag = f"A{A_best}_C{C_best}_{mode_best}"
     # Save tag-specific CSVs if requested and record successes
