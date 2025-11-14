@@ -273,7 +273,15 @@ def solve_global_milp(tasks_df: pd.DataFrame,
                       H: int,
                       Wpeak: float = 40.0,
                       solver_options: Optional[Dict] = None) -> Dict:
-    # Potential bin lattice from all candidates (conditional activation via sA/sC)
+    """
+    Update2+ patched solver:
+    - CHANGE : isAbin/isCbin and zA/zC linearization for exact overhead classification and tighter LP relaxation.
+    - CHANGE : hard line restriction (only category==1 can be line).
+    - CHANGE : mh_bin aggregation variable and per-bin downtime proxy.
+    - CHANGE : parameterized opportunity proxy (bin-based vs task-based), selectable via params.opp_mode.
+    - Minor robustness: initialize binary variables to 0.
+    """
+    # Build bin lattice from all A/C candidates
     candidate_bins = sorted(list(generate_all_potential_bins(H, A_candidates, C_candidates)))
     if not candidate_bins:
         return {'status': 'no_bins'}
@@ -285,131 +293,150 @@ def solve_global_milp(tasks_df: pd.DataFrame,
     men_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['men'].astype(float)))
     cat_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['category'].astype(int)))
 
-    # Precompute allowed (i,t) pairs: strict compliance (bin <= interval_i)
-    allowed_pairs = []
-    for tid in task_ids:
-        interval = interval_map.get(tid, 0.0)
-        if interval <= 0:
-            continue
-        for b in candidate_bins:
-            if b <= interval:
-                allowed_pairs.append((tid, b))
-    # MH per (i,t): use per-occurrence MH of the task
+    # Allowed pairs: strict compliance (bin ≤ interval)
+    allowed_pairs = [(tid, b) for tid in task_ids for b in candidate_bins if b <= interval_map.get(tid, 0.0)]
     allowed_mh = {(tid, b): float(mh_map.get(tid, 0.0)) for (tid, b) in allowed_pairs}
 
-    # Opportunity slack and occurrence count proxy per (i,t)
+    # --- [CHANGE: parameterized opportunity proxy choice] ---
+    # If params.opp_mode == "task": occ_proxy = ceil(H / interval_i)
+    # Else (default "bin"): occ_proxy = capped H // b (bin frequency)
+    opp_mode = getattr(params, "opp_mode", "bin")
+    occ_proxy = {}
+    for (tid, b) in allowed_pairs:
+        if opp_mode == "task":
+            int_i = interval_map.get(tid, 0.0)
+            occ_proxy[(tid, b)] = math.ceil(H / int_i) if int_i > 0 else 0
+        else:
+            occ_proxy[(tid, b)] = min(max(1, int(H // b)), getattr(params, "opp_cap", 10000))
     opp_slack = {(tid, b): max(interval_map.get(tid, 0.0) - b, 0.0) for (tid, b) in allowed_pairs}
-    occ_proxy = {(tid, b): max(1, int(H // b)) for (tid, b) in allowed_pairs}
 
-    # Build model
+    # Model
     model = pyo.ConcreteModel()
     model.TASKS = pyo.Set(initialize=task_ids)
     model.BINS = pyo.Set(initialize=[str(b) for b in candidate_bins])
     model.ACANDS = pyo.Set(initialize=A_candidates)
     model.CCANDS = pyo.Set(initialize=C_candidates)
 
-    # Helpers
     bin_to_fh = {str(b): int(b) for b in candidate_bins}
-    # For speed, prebuild mapping tid -> list of bin keys allowed
     allowed_bins_by_task = {tid: [str(b) for b in candidate_bins if (tid, b) in allowed_mh] for tid in task_ids}
 
     # Variables
-    model.sA = pyo.Var(model.ACANDS, domain=pyo.Binary, initialize=0)
-    model.sC = pyo.Var(model.CCANDS, domain=pyo.Binary, initialize=0)
-    model.v = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
-    model.x = pyo.Var(model.TASKS, model.BINS, domain=pyo.Binary, initialize=0)
-    model.y_line = pyo.Var(model.TASKS, domain=pyo.Binary, initialize=0)  # 1 => treat as line (unpackaged)
+    model.sA = pyo.Var(model.ACANDS, domain=pyo.Binary, initialize=0)     # KEEP init=0
+    model.sC = pyo.Var(model.CCANDS, domain=pyo.Binary, initialize=0)     # KEEP init=0
+    model.v = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)        # KEEP init=0
+    model.x = pyo.Var(model.TASKS, model.BINS, domain=pyo.Binary, initialize=0)  # KEEP init=0
+    model.y_line = pyo.Var(model.TASKS, domain=pyo.Binary, initialize=0)  # KEEP init=0
+
+    # --- [CHANGE: add mh_bin aggregation variable for per-bin downtime proxy] ---
+    model.mh_bin = pyo.Var(model.BINS, domain=pyo.NonNegativeReals)
+
+    # --- [KEEP from Update2: tightened overhead classification] ---
+    model.isAbin = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
+    model.isCbin = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
+    model.zA = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
+    model.zC = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
 
     # Choose exactly one A and one C
     model.chooseA = pyo.Constraint(expr=sum(model.sA[a] for a in model.ACANDS) == 1)
     model.chooseC = pyo.Constraint(expr=sum(model.sC[c] for c in model.CCANDS) == 1)
 
-    # Bin activation linked to chosen A/C:
-    # v[t] <= sum sA[a] (t%a==0) + sum sC[c] (t%c==0)
-    def bin_activation_rule(m, t):
+    # Link isAbin/isCbin to chosen sA/sC (exact classification by divisibility under chosen intervals)
+    def isAbin_rule(m, t):
         fh = bin_to_fh[t]
-        lhs = m.v[t]
-        rhs = sum(m.sA[a] for a in m.ACANDS if fh % a == 0) + sum(m.sC[c] for c in m.CCANDS if fh % c == 0)
-        return lhs <= rhs
-    model.bin_activation_constr = pyo.Constraint(model.BINS, rule=bin_activation_rule)
+        return m.isAbin[t] == sum(m.sA[a] for a in m.ACANDS if fh % a == 0)
+    model.isAbin_constr = pyo.Constraint(model.BINS, rule=isAbin_rule)
 
-    # Assignment constraint: sum_t x[i,t] + y_line[i] == 1 (either packaged exactly once, or line)
+    def isCbin_rule(m, t):
+        fh = bin_to_fh[t]
+        return m.isCbin[t] == sum(m.sC[c] for c in m.CCANDS if fh % c == 0)
+    model.isCbin_constr = pyo.Constraint(model.BINS, rule=isCbin_rule)
+
+    # Linearize zA = isAbin * v, zC = isCbin * v (McCormick/bilinear linearization for binaries)
+    def zA1(m, t): return m.zA[t] <= m.isAbin[t]
+    def zA2(m, t): return m.zA[t] <= m.v[t]
+    def zA3(m, t): return m.zA[t] >= m.isAbin[t] + m.v[t] - 1
+    model.zA1 = pyo.Constraint(model.BINS, rule=zA1)
+    model.zA2 = pyo.Constraint(model.BINS, rule=zA2)
+    model.zA3 = pyo.Constraint(model.BINS, rule=zA3)
+
+    def zC1(m, t): return m.zC[t] <= m.isCbin[t]
+    def zC2(m, t): return m.zC[t] <= m.v[t]
+    def zC3(m, t): return m.zC[t] >= m.isCbin[t] + m.v[t] - 1
+    model.zC1 = pyo.Constraint(model.BINS, rule=zC1)
+    model.zC2 = pyo.Constraint(model.BINS, rule=zC2)
+    model.zC3 = pyo.Constraint(model.BINS, rule=zC3)
+
+    # Assignment constraint (indivisible packaging: exactly one bin OR line)
     def assign_rule(m, i):
         allowed = allowed_bins_by_task.get(i, [])
         if len(allowed) == 0:
-            # no package choice available; must be line
             return m.y_line[i] == 1
-        else:
-            return sum(m.x[i, t] for t in allowed) + m.y_line[i] == 1
+        return sum(m.x[i, t] for t in allowed) + m.y_line[i] == 1
     model.assign_constr = pyo.Constraint(model.TASKS, rule=assign_rule)
 
-    # Linking: x[i,t] <= v[t]
-    def link_rule(m, i, t):
-        return m.x[i, t] <= m.v[t]
+    # --- [CHANGE: hard line restriction — only category==1 can be line] ---
+    def line_restriction_rule(m, i):
+        if cat_map[i] != 1:
+            return m.y_line[i] == 0
+        return pyo.Constraint.Skip
+    model.line_restriction = pyo.Constraint(model.TASKS, rule=line_restriction_rule)
+
+    # Linking: x ≤ v (task assignment only to opened bins)
+    def link_rule(m, i, t): return m.x[i, t] <= m.v[t]
     model.link_constr = pyo.Constraint(model.TASKS, model.BINS, rule=link_rule)
 
-    # Capacity per bin: sum_i MH(i,t) * x[i,t] <= Wpeak * v[t]
+    # Capacity per bin
     def cap_rule(m, t):
         fh = bin_to_fh[t]
         return sum(allowed_mh.get((i, fh), 0.0) * m.x[i, t] for i in m.TASKS) <= Wpeak * m.v[t]
     model.cap_constr = pyo.Constraint(model.BINS, rule=cap_rule)
 
-    # Objective: open overhead + direct + material + downtime proxy + opportunity proxy + line proxy
-    # Downtime proxy coefficient: revenue_per_hour / avg men (avoid division by zero)
+    # --- [CHANGE: mh_bin aggregation per bin for downtime proxy] ---
+    def mh_bin_rule(m, t):
+        fh = bin_to_fh[t]
+        return m.mh_bin[t] == sum(allowed_mh.get((i, fh), 0.0) * m.x[i, t] for i in m.TASKS)
+    model.mh_bin_constr = pyo.Constraint(model.BINS, rule=mh_bin_rule)
+
+    # Objective components
     men_nonzero = [v for v in men_map.values() if v > 0]
     avg_men = max(1.0, np.mean(men_nonzero) if men_nonzero else 1.0)
-    dt_coeff = params.revenue_per_hour / avg_men
 
     def objective_rule(m):
-        # Open overhead per bin; classification (A vs C) depends on chosen C — we approximate with fh % chosen C.
-        open_cost_sum = 0
-        for t in m.BINS:
-            fh = bin_to_fh[t]
-            # is_c if fh is multiple of any selected C; linearize via big-M style: use max over candidates via sC
-            # Here, we approximate: overhead = ohC*(sum sC[c] where fh%c==0) + ohA*(1 - that sum) when v[t]=1.
-            # To keep linear, we choose overhead as: ohC * v[t] if any selected C divides fh, else ohA * v[t].
-            # Implement with upper bound: use per-bin two terms and rely on solver to not open bins that cause inconsistency.
-            is_c_sum = sum(m.sC[c] for c in m.CCANDS if fh % c == 0)
-            # Note: is_c_sum is binary (==1) in feasible solutions because exactly one C is chosen.
-            open_cost_sum += params.ohC * is_c_sum * m.v[t] + params.ohA * (1 - is_c_sum) * m.v[t]
+        # Overhead: exact via zA/zC (KEEP from Update2)
+        overhead = sum(params.ohA * m.zA[t] + params.ohC * m.zC[t] for t in m.BINS)
 
-        # Total MH assigned (linear)
+        # Direct + material (linear in total MH)
         total_mh_expr = sum(allowed_mh.get((i, bin_to_fh[t]), 0.0) * m.x[i, t] for i in m.TASKS for t in m.BINS)
         direct_lab = params.labor_rate * total_mh_expr
         direct_cost = params.phi * direct_lab
         material_cost = params.material_fraction * direct_lab
 
-        # Downtime proxy (linear in MH)
-        downtime_proxy = dt_coeff * total_mh_expr
+        # --- [CHANGE: downtime proxy per bin using mh_bin] ---
+        downtime_proxy = sum((m.mh_bin[t] / avg_men) * params.revenue_per_hour for t in m.BINS)
 
-        # Opportunity proxy: sum over (i,t) revenue_per_hour * occ_proxy(i,t) * slack(i,t) * x[i,t]
+        # Opportunity proxy (parameterized)
         opp_proxy = sum(params.revenue_per_hour *
-                        occ_proxy.get((i, bin_to_fh[t]), 1) *
+                        occ_proxy.get((i, bin_to_fh[t]), 0) *
                         opp_slack.get((i, bin_to_fh[t]), 0.0) *
                         m.x[i, t]
                         for i in m.TASKS for t in m.BINS)
 
-        # Line proxy for y_line[i]=1 (expected line cost over horizon)
+        # Line proxy: expected line cost for eligible line tasks (category==1 only)
         line_proxy = 0
         for i in m.TASKS:
-            # Only allow y_line for category==1; for others, penalize heavily to prevent selection
-            cat = cat_map.get(i, 0)
-            row_mh = mh_map.get(i, 0.0)
-            row_int = interval_map.get(i, 1.0)
-            men_i = men_map.get(i, 0.0)
-            men_eff = men_i if men_i > 0 else 1.0
-            occ = math.ceil(H / row_int) if row_int > 0 else 0
-            occ_lab = params.phi * params.labor_rate * row_mh
-            occ_dt = (row_mh / men_eff) * params.revenue_per_hour
-            occ_oh = params.ohL
-            expected_line_cost = occ * (occ_lab + occ_dt + occ_oh)
-            if cat == 1:
+            if cat_map[i] == 1:
+                row_mh = mh_map.get(i, 0.0)
+                row_int = interval_map.get(i, 1.0)
+                men_i = men_map.get(i, 0.0)
+                men_eff = men_i if men_i > 0 else 1.0
+                occ = math.ceil(H / row_int) if row_int > 0 else 0
+                occ_lab = params.phi * params.labor_rate * row_mh
+                occ_dt = (row_mh / men_eff) * params.revenue_per_hour
+                occ_oh = params.ohL
+                expected_line_cost = occ * (occ_lab + occ_dt + occ_oh)
                 line_proxy += expected_line_cost * m.y_line[i]
-            else:
-                # Discourage line choice for non-line categories by adding a large penalty
-                line_proxy += expected_line_cost * 1000.0 * m.y_line[i]
 
-        return open_cost_sum + direct_cost + material_cost + downtime_proxy + opp_proxy + line_proxy
+        return overhead + direct_cost + material_cost + downtime_proxy + opp_proxy + line_proxy
 
     model.OBJ = pyo.Objective(rule=objective_rule, sense=pyo.minimize)
 
@@ -434,13 +461,11 @@ def solve_global_milp(tasks_df: pd.DataFrame,
     if chosen_A is None or chosen_C is None:
         return {'status': 'no_AC_choice'}
 
-    # Extract packaged pairs
+    # Extract packaged assignments (one bin per task) and build locked schedule by multiples
     chosen_pairs = []
     for i in model.TASKS:
-        # If line chosen, skip packaged assignment
         if pyo.value(model.y_line[i]) > 0.5:
             continue
-        # One bin per packaged task
         for t in model.BINS:
             if pyo.value(model.x[i, t]) > 0.5:
                 fh = bin_to_fh[t]
@@ -448,7 +473,6 @@ def solve_global_milp(tasks_df: pd.DataFrame,
                 chosen_pairs.append((i, fh, mh_per_occ))
                 break
 
-    # Build locked occurrences by propagating multiples of chosen bin per task
     locked_records = []
     for (tid, fh, mh_val) in chosen_pairs:
         if fh <= 0:
@@ -459,12 +483,11 @@ def solve_global_milp(tasks_df: pd.DataFrame,
             locked_records.append((str(tid), int(d), fh, float(mh_val), 'MILP-assigned', lvl, 0.0))
     locked_df = pd.DataFrame(locked_records, columns=['task_id', 'due', 'bin', 'mh', 'method', 'check_level', 'slack'])
 
-    # Exact recompute of baseline cost
+    # Exact recomputation for auditable reporting (KEEP existing function)
     exact_costs = compute_costs_from_locked(locked_df, tasks_df, params, chosen_A, chosen_C, H)
 
-    status = 'ok'
     return {
-        'status': status,
+        'status': 'ok',
         'model': model,
         'A': chosen_A,
         'C': chosen_C,
