@@ -31,6 +31,7 @@ Requires:
  - mtp_preprocessing.py  (with progress_callback support)
  - mtp_heuristic_baseline.py
  - mtp_milp_optimizer.py
+
 """
 
 import os
@@ -222,7 +223,9 @@ class MPDFrontend(tk.Tk):
         # Buttons to run baseline / MILP (keeps original quick-launch layout)
         tk.Button(frm_opt, text="Run Baseline Optimizer", command=lambda: self.run_optimizer(DEFAULT_BASELINE_SCRIPT, "BASELINE")).grid(row=0, column=0, padx=4, pady=6)
         tk.Button(frm_opt, text="Run MILP Optimizer", command=lambda: self.run_optimizer(DEFAULT_MILP_SCRIPT, "MILP")).grid(row=0, column=1, padx=4, pady=6)
-        tk.Button(frm_opt, text="View Optimizer Input", command=self.view_optimizer_input).grid(row=0, column=2, padx=4, pady=6)
+        tk.Button(frm_opt, text="View Optimizer Input", command=self.view_optimizer_input).grid(row=0, column=2, padx=4, pady=6, sticky=tk.W+tk.E)
+        tk.Button(frm_opt, text="View Base/Hangar Tasks", command=self.view_base_hangar).grid(row=0, column=3, padx=4, pady=6, sticky=tk.W+tk.E)
+
 
         # Interval inputs (A/C)
         labels = [("A_min", self.A_min), ("A_max", self.A_max), ("A_step", self.A_step),
@@ -341,6 +344,22 @@ class MPDFrontend(tk.Tk):
             else: subprocess.run(["xdg-open", out])
         except Exception as e:
             self.log(f"[ERROR] Could not open folder: {e}")
+
+    def view_base_hangar(self):
+        path = Path(self.output_dir.get() or "output") / "Base_Hangar_Tasks_List.csv"
+        if not path.exists():
+            messagebox.showinfo("File not found", f"{path} not found.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(path)])
+            else:
+                subprocess.run(["xdg-open", str(path)])
+            self.log(f"[INFO] Opened: {path}")
+        except Exception as e:
+            self.log(f"[ERROR] Failed to open Base/Hangar list: {e}")
 
     def view_optimizer_input(self):
         path = Path(self.output_dir.get() or "output") / "optimizer_input.csv"
