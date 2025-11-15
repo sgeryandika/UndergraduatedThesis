@@ -1,4 +1,5 @@
 """
+mtp_frontend.py (in_progress --> can be run and integrated with all program but UI still need some correction)
 Integrated Frontend for MPD Preprocessing and Optimizers
 -------------------------------------------------------
 
@@ -51,6 +52,8 @@ try:
 except Exception:
     pd = None
     plt = None
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 # -------------------------
 # Helper: Config loader/updater
@@ -519,110 +522,128 @@ class MPDFrontend(tk.Tk):
     # -------------------------
     def run_optimizer(self, script_path: str, label: str):
         """
+        Windows-safe, error-proof optimizer launcher.
+        Uses argument list (not shlex), absolute paths,
+        and no POSIX quoting to prevent WinError 2.
         Launches optimizer script_path with proper args, validates GUI inputs,
         and logs output into GUI. This function supports both legacy flags
         (--A_min etc.) and the new --config flag usage.
         """
+
+        # Ensure optimizer_input.csv exists
         input_file = Path(self.output_dir.get() or "output") / "optimizer_input.csv"
         if not input_file.exists() or input_file.stat().st_size == 0:
-            messagebox.showwarning("Missing Input", "Run preprocessing first to generate optimizer_input.csv (non-empty).")
+            messagebox.showwarning("Missing Input", "Run preprocessing first to generate optimizer_input.csv.")
             return
 
-        script_path = Path(script_path)
+        # Resolve optimizer script path
+        script_path = Path(script_path).resolve()
         if not script_path.exists():
-            # try resolve via config paths
-            alt = PATHS.get("milp_optimizer" if label == "MILP" else "heuristic_optimizer")
+            # Fallback: try config.json alternative path
+            cfg_key = "milp_optimizer" if label == "MILP" else "heuristic_optimizer"
+            alt = PATHS.get(cfg_key)
             if alt:
-                script_path = Path(alt)
+                script_path = Path(alt).resolve()
+
         if not script_path.exists():
             messagebox.showwarning("Missing Script", f"{script_path} not found.")
             return
 
         # -------------------------
-        # Validate numeric GUI fields strictly
+        # Validate numeric fields
         # -------------------------
-        def is_int_str(s):
+        def is_int_string(s):
             try:
                 int(s)
                 return True
-            except Exception:
+            except:
                 return False
 
-        required_fields = [
-            ("A_min", self.A_min.get()), ("A_max", self.A_max.get()), ("A_step", self.A_step.get()),
-            ("C_min", self.C_min.get()), ("C_max", self.C_max.get()), ("C_step", self.C_step.get()),
+        fields = [
+            ("A_min", self.A_min.get()),
+            ("A_max", self.A_max.get()),
+            ("A_step", self.A_step.get()),
+            ("C_min", self.C_min.get()),
+            ("C_max", self.C_max.get()),
+            ("C_step", self.C_step.get()),
             ("H", self.H.get())
         ]
-        for name, val in required_fields:
-            if not val or not str(val).strip():
-                messagebox.showwarning("Missing Input", f"Please provide {name} before running optimizer.")
+
+        for name, val in fields:
+            if not val.strip():
+                messagebox.showwarning("Missing Input", f"Please provide {name}.")
                 return
-            if name != "H" and not is_int_str(val.strip()):
+            if not is_int_string(val):
                 messagebox.showwarning("Invalid Input", f"{name} must be an integer.")
                 return
-            # H should be integer too
-            if name == "H" and not is_int_str(val.strip()):
-                messagebox.showwarning("Invalid Input", "H (planning horizon) must be an integer.")
-                return
 
         # -------------------------
-        # Build optional output flags based on user selections
+        # Build safe argument list
         # -------------------------
-        output_flags = []
+        input_file = input_file.resolve()
+
+        cmd_list = [
+            sys.executable,                      # Python interpreter
+            str(script_path),                    # Optimizer script
+            "--input", str(input_file),
+            "--A_min", self.A_min.get(),
+            "--A_max", self.A_max.get(),
+            "--A_step", self.A_step.get(),
+            "--C_min", self.C_min.get(),
+            "--C_max", self.C_max.get(),
+            "--C_step", self.C_step.get(),
+            "--H", self.H.get(),
+            "--config", "config.json"            # Always supply config.json
+        ]
+
+        # Append optional flags
         if self.save_validation.get():
-            output_flags.append("--save_validation")
+            cmd_list.append("--save_validation")
         if self.save_summary.get():
-            output_flags.append("--save_package_summary")
+            cmd_list.append("--save_package_summary")
         if self.save_plots.get():
-            output_flags.append("--save_plots")
-        # Always pass config so optimizers pick up shared defaults
-        output_flags.append("--config")
-        output_flags.append("config.json")
+            cmd_list.append("--save_plots")
 
-        output_flags_str = " ".join(output_flags)
+        # For debugging/logging only
+        self.log("[INFO] Command: " + " ".join(f"\"{c}\"" if " " in c else c for c in cmd_list))
 
         # -------------------------
-        # Build command string (legacy range style kept for frontend)
-        # If you later prefer candidate lists you can convert ranges here.
+        # Run optimizer in background thread
         # -------------------------
-        cmd = (
-            f"{sys.executable} {shlex.quote(str(script_path))} "
-            f"--input {shlex.quote(str(input_file))} "
-            f"--A_min {self.A_min.get()} --A_max {self.A_max.get()} --A_step {self.A_step.get()} "
-            f"--C_min {self.C_min.get()} --C_max {self.C_max.get()} --C_step {self.C_step.get()} "
-            f"--H {self.H.get()} "
-            f"{output_flags_str}"
-        )
-
-        self.log(f"[INFO] Launching {label} optimizer: {script_path.name}")
-        self.log(f"[INFO] Command: {cmd}")
-
-        # Launch subprocess in thread and stream logs
         def worker():
             self.progress.config(mode="indeterminate")
             self.progress.start(15)
+
             try:
-                # Use shlex.split for safe arg list
-                proc = subprocess.Popen(shlex.split(cmd), shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                # stream stdout lines
+                proc = subprocess.Popen(
+                    cmd_list,
+                    shell=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True
+                )
+
+                # Stream logs line-by-line
                 for line in iter(proc.stdout.readline, ''):
                     if not line:
                         break
-                    # Prefix log line with label
                     self.log(f"[{label}] {line.strip()}")
+
                 proc.wait()
+
                 if proc.returncode == 0:
                     self.log(f"[INFO] {label} optimizer finished successfully.")
                 else:
                     self.log(f"[ERROR] {label} optimizer exited with code {proc.returncode}")
-                # Post-run behaviors
+
+                # Auto-open plots if user enabled it
                 if self.save_plots.get() and self.auto_open_plots.get():
-                    # open output dir
                     try:
                         self.open_output_folder()
-                    except Exception:
+                    except:
                         pass
-                # If user chose to remember session, save selected defaults
+
+                # Remember last session
                 if self.remember_last_session.get():
                     try:
                         update_config("config.json", "defaults", "H", int(self.H.get()))
@@ -632,20 +653,22 @@ class MPDFrontend(tk.Tk):
                         update_config("config.json", "defaults", "C_min", int(self.C_min.get()))
                         update_config("config.json", "defaults", "C_max", int(self.C_max.get()))
                         update_config("config.json", "defaults", "C_step", int(self.C_step.get()))
-                        # also frontend flags
+
                         update_config("config.json", "frontend", "remember_last_session", bool(self.remember_last_session.get()))
                         update_config("config.json", "frontend", "auto_open_plots", bool(self.auto_open_plots.get()))
                     except Exception as e:
-                        self.log(f"[WARN] Failed to update config.json: {e}")
+                        self.log(f"[WARN] Failed to save config.json: {e}")
+
             except Exception as e:
                 self.log(f"[ERROR] {label} run failed: {e}")
                 self.log(traceback.format_exc())
+
             finally:
                 try:
                     self.progress.stop()
                     self.progress.config(mode="determinate")
                     self.progress["value"] = 0
-                except Exception:
+                except:
                     pass
 
         threading.Thread(target=worker, daemon=True).start()
