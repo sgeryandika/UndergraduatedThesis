@@ -1,6 +1,6 @@
 # UndergraduatedThesis – Maintenance Packaging Problem
 
-This repository contains the code and materials developed for my undergraduate thesis on the **Maintenance Tasks Packaging Problem**.  
+This repository contains the code and materials developed for my undergraduate thesis on the **Aircraft Maintenance Tasks Packaging Problem**.  
 The project explores how to optimize maintenance tasks packaging using **heuristic baselines** and **Mixed-Integer Linear Programming (MILP)** models, with preprocessing and frontend components to support realistic workflows.
 
 ---
