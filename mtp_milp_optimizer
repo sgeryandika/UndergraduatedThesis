@@ -1,4 +1,5 @@
 """
+mtp_milp_optimizer.py (in_progress --> already running but some enhancement and refinement in progress) 
 MILP optimizer (Pyomo + Gurobi) with endogenous A/C selection, opportunity proxy,
 and line-task decision — global optimum across A and C candidates in one solve.
 
@@ -20,8 +21,8 @@ Features:
 
 CLI:
   --input <CSV>  required
-  --A_candidates "400,500,600"   comma-separated list
-  --C_candidates "4000,5000,9000"  comma-separated list
+  --A_candidates input through frontend
+  --C_candidates input through frontend
   --H <int> planning horizon (default Params.H)
   --Wpeak <float> per-bin MH capacity
   --time_limit <int> Gurobi time limit (s)
@@ -43,6 +44,8 @@ Notes:
 import argparse
 import math
 import time
+import os
+import json
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
@@ -54,6 +57,21 @@ from pyomo.opt import SolverFactory
 
 import matplotlib.pyplot as plt
 
+# -------------------------------------------------------------------
+# Load configuration (json overrides)
+# -------------------------------------------------------------------
+def load_config(path="config.json"):
+    """Safely load configuration JSON if available."""
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                cfg = json.load(f)
+            return cfg
+        except Exception as e:
+            print(f"[WARN] Failed to load config.json: {e}")
+            return {}
+    else:
+        return {}
 
 # ---------------------------
 # Parameters
@@ -275,10 +293,10 @@ def solve_global_milp(tasks_df: pd.DataFrame,
                       solver_options: Optional[Dict] = None) -> Dict:
     """
     Update2+ patched solver:
-    - CHANGE : isAbin/isCbin and zA/zC linearization for exact overhead classification and tighter LP relaxation.
-    - CHANGE : hard line restriction (only category==1 can be line).
-    - CHANGE : mh_bin aggregation variable and per-bin downtime proxy.
-    - CHANGE : parameterized opportunity proxy (bin-based vs task-based), selectable via params.opp_mode.
+    - KEEP (Update2): isAbin/isCbin and zA/zC linearization for exact overhead classification and tighter LP relaxation.
+    - CHANGE (Third Design): hard line restriction (only category==1 can be line).
+    - CHANGE (Third Design): mh_bin aggregation variable and per-bin downtime proxy.
+    - CHANGE (First/Third Design): parameterized opportunity proxy (bin-based vs task-based), selectable via params.opp_mode.
     - Minor robustness: initialize binary variables to 0.
     """
     # Build bin lattice from all A/C candidates
@@ -330,7 +348,7 @@ def solve_global_milp(tasks_df: pd.DataFrame,
     # --- [CHANGE: add mh_bin aggregation variable for per-bin downtime proxy] ---
     model.mh_bin = pyo.Var(model.BINS, domain=pyo.NonNegativeReals)
 
-    # --- [KEEP from Update2: tightened overhead classification] ---
+    # --- [CHANGE: tightened overhead classification] ---
     model.isAbin = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
     model.isCbin = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
     model.zA = pyo.Var(model.BINS, domain=pyo.Binary, initialize=0)
@@ -473,6 +491,7 @@ def solve_global_milp(tasks_df: pd.DataFrame,
                 chosen_pairs.append((i, fh, mh_per_occ))
                 break
 
+    # Build locked schedule by propagating at multiples
     locked_records = []
     for (tid, fh, mh_val) in chosen_pairs:
         if fh <= 0:
@@ -539,17 +558,77 @@ def plot_occurrence_histogram(locked: pd.DataFrame, C: int, viz_horizon: int, sa
 # CLI and main
 # ---------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Global MILP optimizer with endogenous A/C selection")
-    p.add_argument('--input', '-i', required=True, help="path to optimizer_input CSV")
-    p.add_argument('--A_candidates', type=str, default="400,500,600,700,800,900,1000", help="comma-separated A values")
-    p.add_argument('--C_candidates', type=str, default="4000,5000,6000,7000,8000,9000", help="comma-separated C values")
+    """
+    Argument parser — supports both CLI overrides and config.json defaults.
+    """
+    import argparse
+    p = argparse.ArgumentParser(description="MTP Global MILP optimizer with config support")
+
+    # --- Inputs & ranges ---
+    p.add_argument('--input', '-i', required=True, help="Path to optimizer_input CSV file")
     p.add_argument('--H', type=int, default=None, help="Planning horizon (FH)")
+    p.add_argument('--A_candidates', type=str, default=None)
+    p.add_argument('--C_candidates', type=str, default=None)
+    p.add_argument('--A_min', type=int, default=400)
+    p.add_argument('--A_max', type=int, default=1000)
+    p.add_argument('--A_step', type=int, default=100)
+    p.add_argument('--C_min', type=int, default=4000)
+    p.add_argument('--C_max', type=int, default=9000)
+    p.add_argument('--C_step', type=int, default=1000)
+
+    # --- Optimizer parameters ---
     p.add_argument('--Wpeak', type=float, default=40.0, help="peak manhours capacity per package")
     p.add_argument('--time_limit', type=int, default=300, help="Gurobi time limit (s)")
     p.add_argument('--mip_gap', type=float, default=0.01, help="Relative MIPGap")
     p.add_argument('--viz_horizon', type=int, default=50000)
     p.add_argument('--save_outputs', action='store_true')
-    return p.parse_args()
+    p.add_argument('--save_validation', action='store_true')
+    p.add_argument('--save_package_summary', action='store_true')
+    p.add_argument('--save_plots', action='store_true')
+
+    # --- Config file path ---
+    p.add_argument('--config', type=str, default="config.json",
+                   help="Path to configuration JSON file (default: config.json)")
+
+    args = p.parse_args()
+
+    # --- Load config if available ---
+    cfg = load_config(args.config)
+    if cfg:
+        params = cfg.get("optimizer_params", {})
+        defaults = cfg.get("defaults", {})
+
+        # Merge defaults (only if not specified by CLI)
+        args.H = args.H or defaults.get("H")
+        args.Wpeak = args.Wpeak or params.get("Wpeak", 40)
+        args.time_limit = args.time_limit or params.get("time_limit", 300)
+        args.mip_gap = args.mip_gap or params.get("mip_gap", 0.01)
+        args.viz_horizon = args.viz_horizon or params.get("viz_horizon", 50000)
+
+        # If range inputs not given, use defaults from config
+        for key in ["A_min", "A_max", "A_step", "C_min", "C_max", "C_step"]:
+            if getattr(args, key) is None and key in defaults:
+                setattr(args, key, defaults[key])
+
+    # --- Backward compatibility for candidate lists ---
+    def build_candidates(min_v, max_v, step):
+        try:
+            return ",".join(str(x) for x in range(int(min_v), int(max_v) + 1, int(step)))
+        except Exception:
+            return ""
+
+    if not args.A_candidates and args.A_min and args.A_max and args.A_step:
+        args.A_candidates = build_candidates(args.A_min, args.A_max, args.A_step)
+    if not args.C_candidates and args.C_min and args.C_max and args.C_step:
+        args.C_candidates = build_candidates(args.C_min, args.C_max, args.C_step)
+
+    # --- Umbrella save flag ---
+    if args.save_outputs:
+        args.save_validation = True
+        args.save_package_summary = True
+        args.save_plots = True
+
+    return args
 
 
 def main():
