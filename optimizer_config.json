@@ -1,0 +1,33 @@
+{
+  "paths": {
+    "default_input_dir": "input",
+    "default_output_dir": "output",
+    "preprocessing_script": "mtp_preprocessing.py",
+    "heuristic_optimizer": "mtp_heuristic_baseline.py",
+    "milp_optimizer": "mtp_milp_optimizer.py"
+  },
+  "defaults": {
+    "H": 24000,
+    "A_min": 400,
+    "A_max": 1000,
+    "A_step": 100,
+    "C_min": 4000,
+    "C_max": 9000,
+    "C_step": 1000
+  },
+  "optimizer_params": {
+    "Wpeak": 40,
+    "time_limit": 300,
+    "mip_gap": 0.01,
+    "viz_horizon": 50000
+  },
+  "cost_params": {
+    "LaborRate": 50,
+    "OverheadRate": 1.25,
+    "MaterialFactor": 1.10
+  },
+  "frontend": {
+    "remember_last_session": true,
+    "auto_open_plots": false
+  }
+}

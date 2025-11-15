@@ -1,0 +1,73 @@
+{
+  // ───────────────────────────────
+  //  PATH SETTINGS
+  // ───────────────────────────────
+  "paths": {
+    // Default MPD input directory
+    "default_input_dir": "input",
+
+    // Default output directory where optimizer_input.csv and results are stored
+    "default_output_dir": "output",
+
+    // Script paths used by mtp_frontend to call subprocesses
+    "preprocessing_script": "mtp_preprocessing.py",
+    "heuristic_optimizer": "mtp_heuristic_baseline.py",
+    "milp_optimizer": "mtp_milp_optimizer.py"
+  },
+
+  // ───────────────────────────────
+  //  DEFAULT USER INPUTS (GUI)
+  // ───────────────────────────────
+  "defaults": {
+    // Planning horizon in flight hours (FH)
+    "H": 24000,
+
+    // A-check intervals (range-style inputs)
+    "A_min": 400,
+    "A_max": 1000,
+    "A_step": 100,
+
+    // C-check intervals (range-style inputs)
+    "C_min": 4000,
+    "C_max": 9000,
+    "C_step": 1000
+  },
+
+  // ───────────────────────────────
+  //  OPTIMIZER PARAMETERS (Shared)
+  // ───────────────────────────────
+  "optimizer_params": {
+    // Maximum allowable manhours per package
+    "Wpeak": 40,
+
+    // Gurobi time limit for MILP (seconds)
+    "time_limit": 300,
+
+    // Relative MIP gap (fraction)
+    "mip_gap": 0.01,
+
+    // Visualization horizon for plots (FH)
+    "viz_horizon": 50000
+  },
+
+  // ───────────────────────────────
+  //  COST AND RESOURCE PARAMETERS (Optional future use)
+  // ───────────────────────────────
+  "cost_params": {
+    // Example future extension: labor and overhead cost rates
+    "LaborRate": 50,
+    "OverheadRate": 1.25,
+    "MaterialFactor": 1.10
+  },
+
+  // ───────────────────────────────
+  //  FRONTEND BEHAVIOR (Optional)
+  // ───────────────────────────────
+  "frontend": {
+    // Auto-load last-used inputs on startup
+    "remember_last_session": true,
+
+    // Automatically open plots after run
+    "auto_open_plots": false
+  }
+}
