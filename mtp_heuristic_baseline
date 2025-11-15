@@ -1,5 +1,5 @@
 """
-mtp_heuristic_baseline.py  (corrected, final)
+mtp_heuristic_baseline.py  (in_progress --> already running but will be additional enhancement)
 
 Fully integrated aircraft maintenance task packaging optimizer.
 - Takes optimizer_input CSV (RowID, TaskID, IntervalFH, ManhoursRT, Men, Categories, Zone)
@@ -14,13 +14,14 @@ Fully integrated aircraft maintenance task packaging optimizer.
     - cost_summary_all_combinations.csv (all tested combos)
     - package_hist_A{A}_C{C}_{mode}.png
     - cumulative_A{A}_C{C}_{mode}.png
-    - Gantt event visualization
+    - Gantt chart visualization model in .csv data and plot (.png)
 """
 
 import argparse
 import math
 import time
 import sys
+import json, os
 import matplotlib.patches as mpatches
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
@@ -33,6 +34,22 @@ import matplotlib.pyplot as plt
 # GLOBAL SETTINGS
 # -------------------------------------------------------------------
 VERBOSE = False   # Toggle detailed debug output
+
+# -------------------------------------------------------------------
+# Load configuration (json overrides)
+# -------------------------------------------------------------------
+def load_config(path="config.json"):
+    """Safely load configuration JSON if available."""
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                cfg = json.load(f)
+            return cfg
+        except Exception as e:
+            print(f"[WARN] Failed to load config.json: {e}")
+            return {}
+    else:
+        return {}
 
 # ---------------------------
 # Parameters dataclass
@@ -198,9 +215,9 @@ def map_task_occurrences_to_bins(tasks_df: pd.DataFrame, A: int, C: int, H: int,
                         per_mh = float(mh / a_list.size)
                         for a_bin in a_list:
                             # --- Adaptive A-package stop rule (for equalized case) ---
-                            # next_C_multiple = math.ceil(a_bin / C) * C
-                            # if a_bin > next_C_multiple:
-                            #    continue  # skip A-bins beyond next C boundary
+                            next_C_multiple = math.ceil(a_bin / C) * C
+                            if a_bin > next_C_multiple:
+                                continue  # skip A-bins beyond next C boundary
 
                             slack = max(interval - a_bin, 0.0)
                             records.append((tid, int(d), int(a_bin), per_mh, 'C-eq', 'C', slack, cat))
@@ -1377,21 +1394,51 @@ def grid_search_input(input_csv: str,
 # CLI and main
 # ---------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="MTP Heuristic Baseline v4 optimizer (final)")
-    p.add_argument('--input', '-i', required=True, help="path to optimizer_input CSV")
+    """
+    Argument parser — supports both CLI overrides and config.json defaults.
+    """
+    p = argparse.ArgumentParser(description="MTP Heuristic Baseline optimizer with config support")
+
+    # --- Inputs & ranges ---
+    p.add_argument('--input', '-i', required=True, help="Path to optimizer_input CSV file")
+    p.add_argument('--chooser', type=str, choices=['min_slack', 'earliest'], default='min_slack')
+    p.add_argument('--H', type=int, default=None, help="Planning horizon (FH) to override Params.H")
     p.add_argument('--A_min', type=int, default=400)
     p.add_argument('--A_max', type=int, default=1000)
     p.add_argument('--A_step', type=int, default=100)
     p.add_argument('--C_min', type=int, default=4000)
     p.add_argument('--C_max', type=int, default=9000)
     p.add_argument('--C_step', type=int, default=1000)
-    p.add_argument('--chooser', type=str, choices=['min_slack', 'earliest'], default='min_slack')
-    p.add_argument('--H', type=int, default=None, help="Planning horizon (FH) to override Params.H")
-    p.add_argument('--visual_horizon', type=int, default=50000)
+
+    # --- Runtime options ---
+    p.add_argument('--time_limit', type=int, default=None)
     p.add_argument('--save_validation', action='store_true')
     p.add_argument('--save_package_summary', action='store_true')
     p.add_argument('--save_cost_summary', action='store_true')
-    return p.parse_args()
+    p.add_argument('--visual_horizon', type=int, default=50000, help="Visualization horizon (FH) for plots")
+    p.add_argument('--save_plots', action='store_true')
+
+    # --- Config file path ---
+    p.add_argument('--config', type=str, default="config.json",
+                   help="Path to configuration JSON file (default: config.json)")
+
+    args = p.parse_args()
+
+    # --- Load config if available ---
+    cfg = load_config(args.config)
+    if cfg:
+        params = cfg.get("optimizer_params", {})
+        defaults = cfg.get("defaults", {})
+
+        # Merge defaults (only if not provided by CLI)
+        args.H = args.H or defaults.get("H")
+        args.time_limit = args.time_limit or params.get("time_limit", 300)
+
+        for key in ["A_min", "A_max", "A_step", "C_min", "C_max", "C_step"]:
+            if getattr(args, key) is None and key in defaults:
+                setattr(args, key, defaults[key])
+
+    return args
 
 
 def main():
