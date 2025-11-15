@@ -9,6 +9,8 @@ Preprocessing for MPD -> cleaned CSV/XLSX + optimizer_input.csv (in ./output/)
     ./output/<output_csv>             (full cleaned CSV)
     ./output/optimizer_input.csv      (filtered subset for optimizer)
 Returns: (df_final, optimizer_path, total_rows, num_valid_optimizer_rows)
+
+Author: sgeryandika
 """
 
 import re
@@ -59,12 +61,13 @@ def clean_mpd(file_path,
     rename_map = {
         "TASK\nNUMBER": "TaskID",
         "ZONE": "Zone",
-        "TASK CODE": "TaskType",
+        "SKILL CODE": "SkillCode",
+        "TASK CODE": "TaskCode",
         "TASK\nM.H.": "TaskMH",
         "ACCESS\nM.H.": "AccessMH",
         "PREP.\nM.H.": "PrepMH",
         "MEN": "Men",
-        "TCI": "TCU",
+        "TCI": "TimeControlledItem",
         "TPS": "TPS",
         "SAMPLE\nTHRESHOLD": "SampleThreshold",
         "SAMPLE\nINTERVAL": "SampleInterval",
@@ -132,6 +135,21 @@ def clean_mpd(file_path,
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+     # --- Fill missing values and conversions (do only if cols exist) ---
+    if "TimeControlledItem" in df.columns:
+        # accept 'T' => 1, otherwise 0. Also handle numeric 1/0
+        def conv_tcu(x):
+            if pd.isna(x):
+                return 0
+            sx = str(x).strip().upper()
+            if sx == "T":
+                return 1
+            try:
+                return int(float(sx))
+            except:
+                return 0
+        df["TimeControlledItem"] = df["TimeControlledItem"].apply(conv_tcu)
+
     # --- TPS parsing ---
     if "TPS" in df.columns:
         def parse_tps(v):
@@ -185,20 +203,44 @@ def clean_mpd(file_path,
         df["MenZero"] = 1
 
     # --- Categories flag from Check_Categories ---
-    if "Check_Categories" in df.columns:
-        def map_categories(v):
-            if pd.isna(v):
-                return 1
-            s = str(v).strip().upper()
-            if "LINE" in s:
-                return 1
-            if "BASE" in s or "HANGAR" in s:
-                return 0
-            return 1
-        df["Categories"] = df["Check_Categories"].apply(map_categories)
-    else:
-        df["Categories"] = 1
+    def detect_categories(row):
+        # Default: Line
+        cat_val = 1
 
+        # Check the Check_Categories column
+        if "Check_Categories" in row and pd.notna(row["Check_Categories"]):
+            s = str(row["Check_Categories"]).upper()
+            if "BASE" in s or "HANGAR" in s:
+                cat_val = 0
+            elif "LINE" in s:
+                cat_val = 1
+
+        # Task Code rules
+        if "Task Code" in row and pd.notna(row["Task Code"]):
+            tc = str(row["Task Code"]).upper()
+            if "C-CHECK" in tc or "DOCK" in tc or "SHOP" in tc:
+                cat_val = 0
+
+        # Skill Code rules
+        if "Skill Code" in row and pd.notna(row["Skill Code"]):
+            sc = str(row["Skill Code"]).upper()
+            if sc == "NDT":
+                # Look deeper into Description
+                if "Description" in row and pd.notna(row["Description"]):
+                    desc = str(row["Description"]).upper()
+                    if "ULTRASONIC" in desc or "OVERHAUL" in desc:
+                        cat_val = 0
+
+        # Description rules
+        if "Description" in row and pd.notna(row["Description"]):
+            desc = str(row["Description"]).upper()
+            if "MAJOR OVERHAUL" in desc or "STRUCTURAL REPAIR" in desc:
+                cat_val = 0
+
+        return cat_val
+
+    df["Categories"] = df.apply(detect_categories, axis=1)
+    
     # --- RowID sequential integers ---
     df.insert(0, "RowID", range(1, len(df) + 1))
 
@@ -224,11 +266,24 @@ def clean_mpd(file_path,
     df_final.to_csv(out_csv_path, index=False)
 
     # --- Build optimizer_input.csv (filtered) ---
-    df_optimizer = df_final[(df_final["IntervalFH"] != 0) | (df_final["ManhoursRT"] != 0)].copy()
+    df_optimizer = df_final[(df_final["IntervalFH"] > 0) & (df_final["ManhoursRT"] > 0)].copy()
     cols_for_optimizer = [c for c in ["RowID", "TaskID", "IntervalFH", "ManhoursRT", "Men", "Categories", "Zone"] if c in df_optimizer.columns]
     df_opt = df_optimizer[cols_for_optimizer]
     optimizer_path = out_dir / "optimizer_input.csv"
     df_opt.to_csv(optimizer_path, index=False)
+
+    # --- NEW: Base/Hangar Tasks List (Categories == 0) ---
+    hangar_cols = [
+        "RowID", "TaskID", "Description", "Skill Code", "Task Code",
+        "IntervalFH", "Justification"
+    ]
+    # Keep only those columns if they exist in df_final
+    hangar_cols_existing = [c for c in hangar_cols if c in df_final.columns]
+
+    base_hangar_df = df_final[df_final["Categories"] == 0][hangar_cols_existing].copy()
+    base_hangar_path = out_dir / "Base_Hangar_Tasks_List.csv"
+    base_hangar_df.to_csv(base_hangar_path, index=False)
+
 
     # Final callback to indicate completion
     if progress_callback:
@@ -239,6 +294,7 @@ def clean_mpd(file_path,
 
     print(f"[INFO] Cleaned CSV saved to: {out_csv_path}")
     print(f"[INFO] Optimizer input saved to: {optimizer_path}")
+    print(f"[INFO] Base/Hangar Tasks List saved to: {base_hangar_path}")
 
     return df_final, optimizer_path, total_rows, len(df_opt)
 
