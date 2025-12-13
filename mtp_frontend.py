@@ -90,13 +90,15 @@ DEFAULT_MILP_SCRIPT = PATHS.get("milp_optimizer", "mtp_milp_optimizer.py")
 # -------------------------
 # Main GUI App
 # -------------------------
-class MPDFrontend(tk.Tk):
+class MTPFrontend(tk.Tk):
     """Main application window.
 
     Major features:
     - MPD browsing and preprocessing runner (threaded)
     - Manual optimizer launch (baseline / MILP)
     - Utilization sweep: runs preprocessing + MILP across FH/day range and saves outputs
+    - Real-time logging to GUI and frontend_log.txt
+    - Compare Results tool (heuristic vs MILP)
     """
 
     def __init__(self):
@@ -1082,5 +1084,6 @@ class MPDFrontend(tk.Tk):
 # Entrypoint
 # -------------------------
 if __name__ == '__main__':
-    app = MPDFrontend()
+    app = MTPFrontend()
     app.mainloop()
+
