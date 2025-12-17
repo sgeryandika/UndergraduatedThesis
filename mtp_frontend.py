@@ -576,25 +576,27 @@ class MTPFrontend(tk.Tk):
             sys.executable,
             str(script_path),
             "--input", str(input_file),
-            "--A_min",
-            self.A_min.get(),
-            "--A_max",
-            self.A_max.get(),
-            "--A_step",
-            self.A_step.get(),
-            "--C_min",
-            self.C_min.get(),
-            "--C_max",
-            self.C_max.get(),
-            "--C_step",
-            self.C_step.get(),
-            "--H",
-            self.H.get(),
+            "--A_min", self.A_min.get(),
+            "--A_max", self.A_max.get(),
+            "--A_step", self.A_step.get(),
+            "--C_min", self.C_min.get(),
+            "--C_max", self.C_max.get(),
+            "--C_step", self.C_step.get(),
+            "--H", self.H.get(),
+            "--config", str(Path("config.json").resolve()),
         ]
 
-        # optional: add --save_outputs if checkboxes set
-        if self.save_plots.get() or self.save_summary.get() or self.save_validation.get():
-            cmd_list += ["--save_outputs"]
+        # Append optional flags
+        if self.save_validation.get():
+            cmd_list.append("--save_validation")
+        if self.save_summary.get():
+            cmd_list.append("--save_package_summary")
+        if self.save_plots.get():
+            cmd_list.append("--save_plots")
+
+        # For debugging/logging only
+        self.log("[INFO] Command: " + " ".join(f"\"{c}\"" if " " in c else c for c in cmd_list))
+        self.log(f"[INFO] Starting {label} optimizer...")
 
         # Run in a thread to avoid blocking UI
         def worker():
@@ -621,34 +623,37 @@ class MTPFrontend(tk.Tk):
     # -------------------------
     def run_utilization_sweep(self):
         """Runs preprocessing + MILP across utilization values and writes:
-           - output/utilization_sweep/utilization_sweep.csv
-           - output/utilization_sweep/utilization_sweep.png
+        - output/utilization_sweep/utilization_sweep.csv
+        - output/utilization_sweep/utilization_sweep.png
 
-           Annotations:
-           - Uses clean_mpd from mtp_preprocessing and solve_global_milp from mtp_milp_optimizer.
-           - Runs in a worker thread to keep GUI responsive.
-           - Saves results in a subfolder `utilization_sweep` under selected output_dir.
+        Annotations:
+        - Uses clean_mpd from mtp_preprocessing and solve_global_milp from mtp_milp_optimizer.
+        - Runs in a worker thread to keep GUI responsive.
+        - Saves results in a subfolder `utilization_sweep` under selected output_dir.
         """
 
         def worker():
             # validate inputs
             try:
-                U_min = int(self.U_min.get())
-                U_max = int(self.U_max.get())
-                U_step = int(self.U_step.get())
+                U_min = float(self.U_min.get())
+                U_max = float(self.U_max.get())
+                U_step = float(self.U_step.get())
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Invalid Input", f"Utilization values must be integers: {e}"))
+                self.after(0, lambda: messagebox.showerror("Invalid Input", f"Utilization values must be numeric: {e}"))
                 return
 
-            fh_range = list(range(U_min, U_max + 1, U_step))
+            # use numpy arange for float steps
+            import numpy as np
+            fh_range = np.arange(U_min, U_max + U_step, U_step)
+
             base_output = Path(self.output_dir.get() or "output")
             sweep_dir = base_output / "utilization_sweep"
             sweep_dir.mkdir(parents=True, exist_ok=True)
 
             results = []
-            self.log(f"[INFO] Starting utilization sweep: {fh_range} FH/day")
+            self.log(f"[INFO] Starting utilization sweep: {list(fh_range)} FH/day")
 
-            # dynamic imports (allow alternative script names via config)
+            # dynamic imports
             try:
                 from mtp_preprocessing import clean_mpd
             except Exception:
@@ -657,24 +662,37 @@ class MTPFrontend(tk.Tk):
                 return
 
             try:
-                from mtp_milp_optimizer import load_tasks, solve_global_milp, Params
+                from mtp_milp_optimizer import load_tasks, solve_global_milp, Params, build_event_downtime_report, compute_event_downtime_stats
             except Exception:
                 self.log("[ERROR] Could not import mtp_milp_optimizer functions — ensure script exists and is on PYTHONPATH")
                 self.after(0, lambda: messagebox.showerror("Import Error", "mtp_milp_optimizer functions not found"))
                 return
 
-            # Build candidate lists (simple endpoints — you can extend to full ranges if desired)
-            A_candidates = [int(self.A_min.get()), int(self.A_max.get())]
-            C_candidates = [int(self.C_min.get()), int(self.C_max.get())]
+            # Build candidate lists using ranges
+            try:
+                A_min = int(self.A_min.get())
+                A_max = int(self.A_max.get())
+                A_step = int(self.A_step.get())
+                A_candidates = list(range(A_min, A_max + 1, A_step))
+
+                C_min = int(self.C_min.get())
+                C_max = int(self.C_max.get())
+                C_step = int(self.C_step.get())
+                C_candidates = list(range(C_min, C_max + 1, C_step))
+            except Exception as e:
+                self.log(f"[ERROR] Invalid A/C interval inputs: {e}")
+                return
+
             H = int(self.H.get())
             params = Params()
 
             for fh_day in fh_range:
                 try:
+                    params = Params()
                     # 1) Preprocess using fh_day
                     _, opt_path, _, _ = clean_mpd(
                         self.mpd_path.get(),
-                        output_csv=f"cleaned_{fh_day}FH.csv",
+                        output_csv=f"cleaned_{fh_day:.2f}FH.csv",
                         FH_per_day=fh_day,
                         FH_per_fc=1.5,
                         FH_per_mo=None,
@@ -686,7 +704,7 @@ class MTPFrontend(tk.Tk):
                     res = solve_global_milp(tasks_df, A_candidates, C_candidates, params, H)
 
                     if res.get("status") != "ok":
-                        self.log(f"[WARN] FH/day={fh_day}: optimizer failed ({res.get('status')})")
+                        self.log(f"[WARN] FH/day={fh_day:.2f}: optimizer failed ({res.get('status')})")
                         continue
 
                     # Extract results
@@ -697,22 +715,20 @@ class MTPFrontend(tk.Tk):
                     total_cost = exact.get("total_with_opportunity", float('nan'))
                     avg_cost_per_fh = exact.get("avg_cost_per_fh_with_opportunity", float('nan'))
 
-                    # Derive average downtime per A/C by inspecting locked_df; fallback robust handling
+                    # Downtime proxy
                     locked = res.get("locked_df")
                     avg_A_downtime = 0.0
                     avg_C_downtime = 0.0
                     if locked is not None and not locked.empty:
                         try:
-                            bin_df = locked.groupby('bin')['mh'].sum().reset_index()
-                            bin_df['is_c'] = bin_df['bin'] % int(C_opt) == 0
-                            A_bins = bin_df[bin_df['is_c'] == False]
-                            C_bins = bin_df[bin_df['is_c'] == True]
-                            # downtime proxy: mh / men is not available here aggregated; use mh as proxy divided by 1 (avg_men)
-                            avg_A_downtime = (A_bins['mh'].sum() / max(len(A_bins), 1)) if not A_bins.empty else 0.0
-                            avg_C_downtime = (C_bins['mh'].sum() / max(len(C_bins), 1)) if not C_bins.empty else 0.0
+                            event_report = build_event_downtime_report(locked, params, viz_horizon=H)
+                            downtime_stats = compute_event_downtime_stats(event_report, C_opt)
+                            avg_A_downtime = downtime_stats['A']['avg']
+                            avg_C_downtime = downtime_stats['C']['avg']
                         except Exception:
-                            avg_A_downtime = 0.0
-                            avg_C_downtime = 0.0
+                            self.log(f"[WARN] Downtime calc failed at FH/day={fh_day:.2f}: {e}")
+                            avg_A_downtime = float('nan')
+                            avg_C_downtime = float('nan')
 
                     results.append({
                         'FH_per_day': fh_day,
@@ -724,10 +740,10 @@ class MTPFrontend(tk.Tk):
                         'avg_cost_per_fh': float(avg_cost_per_fh)
                     })
 
-                    self.log(f"[INFO] FH/day={fh_day}: A={A_opt}, C={C_opt}, avg_cost_fh={avg_cost_per_fh:.2f}")
+                    self.log(f"[INFO] FH/day={fh_day:.2f}: A={A_opt}, C={C_opt}, avg_cost_fh={avg_cost_per_fh:.2f}")
 
                 except Exception as e:
-                    self.log(f"[ERROR] Sweep failed at FH/day={fh_day}: {e}")
+                    self.log(f"[ERROR] Sweep failed at FH/day={fh_day:.2f}: {e}")
                     self.log(traceback.format_exc())
 
             # Save results + plot
@@ -737,21 +753,52 @@ class MTPFrontend(tk.Tk):
                 df.to_csv(csv_out, index=False)
                 self.log(f"[INFO] Utilization sweep CSV saved to {csv_out}")
 
-                # Plot 3 lines: avg_cost_per_fh, A_interval, C_interval
+                # Plot cost + downtime
                 try:
-                    plt.figure(figsize=(10,6))
+                    fig, ax1 = plt.subplots(figsize=(10, 6))
                     x = df['FH_per_day']
-                    plt.plot(x, df['avg_cost_per_fh'], marker='o', label='Avg Cost per FH')
-                    plt.plot(x, df['A_interval'], marker='s', label='A Interval (FH)')
-                    plt.plot(x, df['C_interval'], marker='^', label='C Interval (FH)')
-                    plt.xlabel('Utilization (FH/day)')
-                    plt.ylabel('Value')
-                    plt.title('Utilization Sweep Results')
-                    plt.grid(True)
-                    plt.legend()
+
+                    # Cost axis
+                    ax1.plot(
+                        x, df['avg_cost_per_fh'],
+                        marker='o', linewidth=2,
+                        label="Avg Cost per FH"
+                    )
+                    ax1.set_xlabel("Utilization (FH/day)")
+                    ax1.set_ylabel("Average Cost per FH (USD)")
+                    ax1.grid(True, axis='both', linestyle='--', alpha=0.4)
+
+                    # Downtime axis
+                    ax2 = ax1.twinx()
+                    ax2.plot(
+                        x, df['avg_A_downtime'],
+                        marker='s', linestyle='--',
+                        label="Avg A-event Downtime"
+                    )
+                    ax2.plot(
+                        x, df['avg_C_downtime'],
+                        marker='^', linestyle=':',
+                        label="Avg C-event Downtime"
+                    )
+                    ax2.set_ylabel("Average Downtime per Event (hrs)")
+
+                    # Unified legend
+                    lines1, labels1 = ax1.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax1.legend(
+                        lines1 + lines2,
+                        labels1 + labels2,
+                        loc="upper center",
+                        ncol=3,
+                        frameon=False
+                    )
+
+                    fig.suptitle("Effect of Aircraft Utilization on Cost and Maintenance Downtime")
+                    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
                     fig_out = sweep_dir / 'utilization_sweep.png'
-                    plt.savefig(fig_out, dpi=200)
-                    plt.close()
+                    fig.savefig(fig_out, dpi=200)
+                    plt.close(fig)
                     self.log(f"[INFO] Utilization sweep figure saved to {fig_out}")
                 except Exception as e:
                     self.log(f"[WARN] Plot generation failed: {e}")
@@ -762,9 +809,26 @@ class MTPFrontend(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+
     # -------------------------
     # Utilities: compare_results placeholder
     # -------------------------
+    def extract_cost_comparison(self, rows, exclude=None):
+        exclude = exclude or set()
+        comps, heur, opt, base = [], [], [], []
+
+        for r in rows:
+            label = r["Cost Component"]
+            if label in exclude:
+                continue
+            comps.append(label)
+            heur.append(r["Heuristic (USD)"])
+            opt.append(r["Optimization (USD)"])
+            base.append(r["Baseline (USD)"])
+
+        return comps, heur, opt, base
+
+
     def compare_results(self):
         """
         Option A:
@@ -836,7 +900,7 @@ class MTPFrontend(tk.Tk):
                 heur_A = np.nan
                 heur_C = np.nan
 
-                sweep_csv = out_dir_base / "cost_summary_all_combinations.csv"
+                sweep_csv = Path.cwd() / "cost_summary_all_combinations.csv"
                 if sweep_csv.exists():
                     try:
                         df = pd.read_csv(sweep_csv)
@@ -877,11 +941,17 @@ class MTPFrontend(tk.Tk):
                 milp_A = np.nan
                 milp_C = np.nan
 
-                try:
-                    A_range = [int(self.A_min.get()), int(self.A_max.get())]
-                    C_range = [int(self.C_min.get()), int(self.C_max.get())]
+                from mtp_milp_optimizer import build_event_downtime_report, compute_event_downtime_stats
 
+                milp_stats = {}
+                try:
+                    A_min = int(self.A_min.get()); A_max = int(self.A_max.get()); A_step = int(self.A_step.get())
+                    A_range = list(range(A_min, A_max + 1, A_step))
+                    C_min = int(self.C_min.get()); C_max = int(self.C_max.get()); C_step = int(self.C_step.get())
+                    C_range = list(range(C_min, C_max + 1, C_step))
+                
                     res = solve_global_milp(tasks_df, A_range, C_range, MilpParams(), H)
+                    locked_milp = res.get("locked_df")
 
                     if res.get('status') == 'ok':
                         ex = res['exact_costs']
@@ -895,27 +965,43 @@ class MTPFrontend(tk.Tk):
                         milp_vals['total_with_opportunity'] = ex.get('total_with_opportunity', np.nan)
                         milp_vals['avg_cost_per_fh_with_opportunity'] = ex.get('avg_cost_per_fh_with_opportunity', np.nan)
 
-                        milp_A = res.get("best_A", np.nan)
-                        milp_C = res.get("best_C", np.nan)
+                        milp_A = res.get('A', np.nan)
+                        milp_C = res.get('C', np.nan)
 
+                        event_report_milp = build_event_downtime_report(locked_milp, MilpParams(), viz_horizon=H)
+                        milp_stats = compute_event_downtime_stats(event_report_milp, res.get("best_C", np.nan))
+                        
                         self.log("[INFO] MILP optimization complete.")
                     else:
+                        milp_stats = {'A': {'avg': np.nan, 'max': np.nan, 'count': 0},
+                                    'C': {'avg': np.nan, 'max': np.nan, 'count': 0},
+                                    'total': {'avg': np.nan, 'max': np.nan, 'count': 0}}                        
                         self.log(f"[WARN] MILP solver failed: {res.get('status')}")
                         milp_vals = {k: np.nan for k in heur_vals.keys()}
                 except Exception as e:
+                    self.log(f"[ERROR] MILP downtime stats failed: {e}")
+                    milp_stats = {'A': {'avg': np.nan, 'max': np.nan, 'count': 0},
+                                'C': {'avg': np.nan, 'max': np.nan, 'count': 0},
+                                'total': {'avg': np.nan, 'max': np.nan, 'count': 0}}
                     self.log(f"[ERROR] MILP exception: {e}")
                     milp_vals = {k: np.nan for k in heur_vals.keys()}
 
                 # ===============================================
-                # 3) Baseline (Specialized Heuristic, A=1000, C=14000)
+                # 3) Baseline (Specialized Heuristic, A=1000, C=12000)
                 # ===============================================
                 base_vals = {}
                 base_A = 1000
-                base_C = 14000
+                base_C = 12000
 
+                from mtp_heuristic_baseline import build_event_downtime_report, compute_event_downtime_stats
+
+                base_stats = {}
+                
                 try:
                     cand = map_task_occurrences_to_bins(tasks_df, base_A, base_C, H, mode="block")
-                    locked = lock_and_propagate(cand, tasks_df, base_A, base_C, H)
+                    locked = lock_and_propagate(cand, tasks_df, base_A, base_C, H)                    
+                    event_report_base = build_event_downtime_report(locked, HeurParams(), viz_horizon=H)
+                    base_stats = compute_event_downtime_stats(event_report_base, base_C, HeurParams())
                     costs = compute_costs_from_locked(locked, tasks_df, HeurParams(), base_A, base_C, H)
 
                     base_vals['direct'] = costs.get('direct', np.nan)
@@ -929,6 +1015,10 @@ class MTPFrontend(tk.Tk):
 
                     self.log("[INFO] Specialized heuristic (baseline) computed.")
                 except Exception as e:
+                    self.log(f"[ERROR] Baseline downtime stats failed: {e}")
+                    base_stats = {'A': {'avg': np.nan, 'max': np.nan, 'count': 0},
+                                'C': {'avg': np.nan, 'max': np.nan, 'count': 0},
+                                'total': {'avg': np.nan, 'max': np.nan, 'count': 0}}
                     self.log(f"[ERROR] Specialized heuristic failed: {e}")
                     base_vals = {k: np.nan for k in heur_vals.keys()}
 
@@ -1029,32 +1119,127 @@ class MTPFrontend(tk.Tk):
 
                 pretty_csv = out_dir / "comparison_table_pretty.csv"
                 df_pretty.to_csv(pretty_csv, index=False)
-
-                # Histogram
+    
+                # === Histogram + Summary Table ===
+                # Histogram of downtime comparison
+                # === Downtime Comparison Histogram ===
                 try:
-                    comp_labels = [r["Cost Component"] for r in rows if r["Cost Component"] not in ["Key Parameters","Cost Components","A_interval","C_interval"]]
-                    hvals = [r["Heuristic (USD)"] for r in rows if r["Cost Component"] in comp_labels]
-                    ovals = [r["Optimization (USD)"] for r in rows if r["Cost Component"] in comp_labels]
-                    bvals = [r["Baseline (USD)"] for r in rows if r["Cost Component"] in comp_labels]
+                    # Extract average downtime values
+                    avg_A_milp = milp_stats['A']['avg'] if 'A' in milp_stats else np.nan
+                    avg_C_milp = milp_stats['C']['avg'] if 'C' in milp_stats else np.nan
+                    avg_A_heur = base_stats['A']['avg'] if 'A' in base_stats else np.nan
+                    avg_C_heur = base_stats['C']['avg'] if 'C' in base_stats else np.nan
 
-                    indices = np.arange(len(comp_labels))
-                    width = 0.25
+                    labels = ['A_downtime', 'C_downtime']
+                    milp_values = [avg_A_milp, avg_C_milp]
+                    heur_values = [avg_A_heur, avg_C_heur]
 
-                    plt.figure(figsize=(12, 6))
-                    plt.bar(indices - width, hvals, width=width, label="Heuristic (Best sweep)")
-                    plt.bar(indices, ovals, width=width, label="MILP")
-                    plt.bar(indices + width, bvals, width=width, label="Baseline (Specialized)")
-                    plt.xticks(indices, comp_labels, rotation=30, ha='right')
-                    plt.ylabel("USD")
-                    plt.title("Cost Component Comparison")
-                    plt.legend()
+                    x = np.arange(len(labels))
+                    width = 0.4
+
+                    fig, ax = plt.subplots(figsize=(8,6))
+                    rects1 = ax.bar(x - width/2, milp_values, width,
+                                    label='MILP', color='steelblue')
+                    rects2 = ax.bar(x + width/2, heur_values, width,
+                                    label='Heuristic (Baseline)', color='coral')
+
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(labels)
+                    ax.set_ylabel("Average Downtime (hrs)")
+                    ax.set_title("Average Downtime Comparison")
+                    ax.legend()
+                    ax.grid(axis='y', linestyle='--', alpha=0.4)
+
+                    # Annotate bars
+                    def autolabel(rects):
+                        for rect in rects:
+                            height = rect.get_height()
+                            ax.annotate(f'{height:.2f}',
+                                        xy=(rect.get_x() + rect.get_width()/2, height),
+                                        xytext=(0,3),
+                                        textcoords="offset points",
+                                        ha='center', va='bottom', fontsize=9)
+
+                    autolabel(rects1)
+                    autolabel(rects2)
+
                     plt.tight_layout()
+                    fig_path = out_dir / "comparison_downtime_histogram.png"
+                    fig.savefig(fig_path, dpi=200)
+                    plt.close(fig)
 
+                    self.log(f"[INFO] Downtime comparison histogram saved to {fig_path}")
+
+                except Exception as e:
+                    self.log(f"[WARN] Downtime histogram generation failed: {e}")
+
+                # === Cost Component Comparison Histogram ===
+                try:
+                    exclude_labels = {
+                        "Key Parameters",
+                        "Cost Components",
+                        "A_interval",
+                        "C_interval"
+                    }
+
+                    comp_labels, hvals, ovals, bvals = self.extract_cost_comparison(
+                        rows, exclude=exclude_labels
+                    )
+
+                    x = np.arange(len(comp_labels))
+                    width = 0.28
+
+                    # Summary values
+                    avg_h = heur_vals.get("avg_cost_per_fh_with_opportunity", np.nan)
+                    avg_o = milp_vals.get("avg_cost_per_fh_with_opportunity", np.nan)
+                    avg_b = base_vals.get("avg_cost_per_fh_with_opportunity", np.nan)
+
+                    from matplotlib.gridspec import GridSpec
+                    fig = plt.figure(figsize=(12, 7))
+                    gs = GridSpec(2, 1, height_ratios=[5, 1.3], hspace=0.05)
+
+                    ax = fig.add_subplot(gs[0])
+
+                    ax.bar(x - width, hvals, width, label="Heuristic", alpha=0.85)
+                    ax.bar(x, ovals, width, label="MILP", alpha=0.85)
+                    ax.bar(x + width, bvals, width, label="Baseline", alpha=0.85)
+
+                    ax.set_ylabel("Cost (USD)")
+                    ax.set_title("Cost Component Comparison")
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(comp_labels, rotation=25, ha='right')
+                    ax.grid(axis='y', linestyle='--', alpha=0.4)
+
+                    ax.legend(ncol=3, loc="upper center", frameon=False)
+
+                    # ---- Summary table ----
+                    ax_tbl = fig.add_subplot(gs[1])
+                    ax_tbl.axis("off")
+
+                    table_data = [[
+                        "Avg Cost per FH",
+                        f"{avg_h:,.2f}",
+                        f"{avg_o:,.2f}",
+                        f"{avg_b:,.2f}"
+                    ]]
+
+                    table = ax_tbl.table(
+                        cellText=table_data,
+                        colLabels=["Metric", "Heuristic", "MILP", "Baseline"],
+                        cellLoc="center",
+                        loc="center"
+                    )
+
+                    table.scale(1, 1.8)
+                    table.auto_set_font_size(False)
+                    table.set_fontsize(10)
+
+                    fig.tight_layout()
                     fig_path = out_dir / "comparison_histogram.png"
-                    plt.savefig(fig_path, dpi=200)
-                    plt.close()
+                    fig.savefig(fig_path, dpi=200)
+                    plt.close(fig)
 
-                    self.log(f"[INFO] Comparison histogram saved to {fig_path}")
+                    self.log(f"[INFO] Cost comparison figure saved to {fig_path}")
 
                 except Exception as e:
                     self.log(f"[WARN] Histogram generation failed: {e}")
@@ -1086,4 +1271,3 @@ class MTPFrontend(tk.Tk):
 if __name__ == '__main__':
     app = MTPFrontend()
     app.mainloop()
-
