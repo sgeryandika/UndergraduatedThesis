@@ -63,20 +63,22 @@ def load_config(path="config.json"):
 @dataclass
 class Params:
     # productivity / labour multipliers
-    phi: float = 4/3
-    labor_rate: float = 25.0               # $ per MH
+    phi: float = 3/3
+    labor_rate: float = 60.0               # $ per MH
     material_fraction: float = 0.33        # fraction of labour for materials
-    revenue_per_hour: float = 2000.0       # $ per aircraft FH lost (opportunity)
+    revenue_per_hour: float = 14000.0       # $ per aircraft FH lost (opportunity)
     # overheads
-    ohA: float = 15000.0
-    ohC: float = 80000.0
-    ohL: float = 500.0
+    ohA: float = 40000.0
+    ohC: float = 300000.0
+    ohL: float = 5000.0
     # downtime mapping
-    shift_hours: float = 8.0
+    shift_hours: float = 9.0
     mh_per_shift_A: float = 48.0
     mh_per_shift_C: float = 90.0
+    efficiency: float = 0.3
+    man_availability: float = 10.0
     # planning horizon default (can be overridden via CLI --H)
-    H: int = 180000
+    H: int = 15000
 
 
 # ---------------------------
@@ -123,6 +125,78 @@ def sanitize_line_tasks(df: pd.DataFrame,
         df['interval_fh'] = pd.to_numeric(df['interval_fh'], errors='coerce')
         # Keep NaN for now; grid_search_input will drop NaN/<=0 tasks before mapping
     return df
+
+
+# ---------------------------
+# Downtime computation helper
+# ---------------------------
+def downtime_hours_from_mh(
+    total_mh: float,
+    man_availability: float = 10.0,
+    efficiency: float = 0.3,
+    shift_hours: float = 8.0
+) -> float:
+    """
+    Convert total manhours into equivalent aircraft downtime (hours).
+    """
+    denom = man_availability * efficiency * shift_hours
+    if denom <= 0:
+        return 0.0
+    return float(total_mh) / denom
+
+
+def downtime_cost_from_mh(
+    total_mh: float,
+    revenue_per_hour: float,
+    man_availability: float = 10.0,
+    efficiency: float = 0.3,
+    shift_hours: float = 8.0
+) -> float:
+    """
+    Convert total manhours directly into downtime cost.
+    """
+    return downtime_hours_from_mh(
+        total_mh,
+        man_availability,
+        efficiency,
+        shift_hours
+    ) * revenue_per_hour
+
+
+def compute_event_downtime_stats(
+    event_df: pd.DataFrame,
+    chosen_C: int,
+    params: Params
+) -> Dict[str, Dict[str, float]]:
+    """
+    Compute downtime statistics separated by A and C events.
+    """
+    if event_df is None or event_df.empty:
+        return {
+            'total': {'avg': 0.0, 'max': 0.0, 'count': 0},
+            'A': {'avg': 0.0, 'max': 0.0, 'count': 0},
+            'C': {'avg': 0.0, 'max': 0.0, 'count': 0},
+        }
+
+    df = event_df.copy()
+    df['event_type'] = df['due_fh'].apply(
+        lambda fh: 'C' if fh % chosen_C == 0 else 'A'
+    )
+
+    def summarize(sub):
+        if sub.empty:
+            return {'avg': 0.0, 'max': 0.0, 'count': 0}
+        return {
+            'avg': sub['downtime_hours'].mean(),
+            'max': sub['downtime_hours'].max(),
+            'count': sub.shape[0]
+        }
+
+    return {
+        'total': summarize(df),
+        'A': summarize(df[df['event_type'] == 'A']),
+        'C': summarize(df[df['event_type'] == 'C']),
+    }
 
 
 # ---------------------------
@@ -585,16 +659,20 @@ def build_package_summary(compact_val: pd.DataFrame,
 # ---------------------------
 # Cost computation (full decomposition)
 # ---------------------------
-def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, params: Params, A: int, C: int, H: int) -> Dict[str, float]:
+def compute_costs_from_locked(locked: pd.DataFrame,
+                              tasks_df: pd.DataFrame,
+                              params: Params,
+                              A: int,
+                              C: int,
+                              H: int) -> Dict[str, float]:
     """
-    Compute:
-      - direct (labor * phi)
-      - material (fraction of labor)
-      - overhead (per bin A or C)
-      - downtime (per bin using men or shifts fallback)
-      - line_cost (category==1 tasks left unpackaged)
-      - opportunity_cost (early pull-forward computed per-task using locked occurrences)
+    Synced with MILP optimizer logic:
+      - Overhead recomputed per event (A vs C classification).
+      - Downtime cost uses productivity-based proxy (man_availability * efficiency * shift_hours).
+      - Opportunity cost parameterized (task vs bin mode).
+      - Line cost restricted to category==1 tasks only.
     """
+
     total_mh = float(locked['mh'].sum()) if (locked is not None and not locked.empty) else 0.0
     direct_labour = params.labor_rate * total_mh
     direct = params.phi * direct_labour
@@ -613,29 +691,30 @@ def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, para
         bin_summary = df.groupby('bin', as_index=False).agg(total_mh=('mh', 'sum'), total_men=('men', 'sum'))
         bin_summary['is_c'] = bin_summary['bin'] % C == 0
         bin_summary['overhead'] = bin_summary['is_c'].apply(lambda x: params.ohC if x else params.ohA)
-        overhead_total = float(bin_summary['overhead'].sum())
-
-        # --- SAFEGUARD: prevent division by zero or NaN propagation ---
-        # Replace any zero or NaN total_men with a very small positive number
-        bin_summary['total_men'] = bin_summary['total_men'].replace(0, np.nan)
-        bin_summary['total_men'] = bin_summary['total_men'].fillna(1.0)
-
-        # downtime: total_mh / total_men * revenue_per_hour, fallback to shift estimate if total_men==0
-        def downtime_cost_calc(r):
-            if r['total_men'] > 0:
-                downtime_hours = float(r['total_mh']) / float(r['total_men'])
-                return downtime_hours * params.revenue_per_hour
+        
+        # --- Overhead per event (propagation at multiples) ---
+        for due_fh in locked['due'].unique():
+            if due_fh % C == 0:
+                overhead_total += params.ohC
             else:
-                cap = params.mh_per_shift_C if r['is_c'] else params.mh_per_shift_A
-                shifts = math.ceil(float(r['total_mh']) / cap) if cap > 0 else 0
-                downtime_hours = shifts * params.shift_hours
-                return downtime_hours * params.revenue_per_hour
-        bin_summary['downtime_cost'] = bin_summary.apply(downtime_cost_calc, axis=1)
+                overhead_total += params.ohA
+
+        # --- Downtime proxy (productivity-based) ---
+        bin_summary['downtime_cost'] = bin_summary['total_mh'].apply(
+            lambda mh: downtime_cost_from_mh(
+                mh,
+                params.revenue_per_hour,
+                params.man_availability,
+                params.efficiency,
+                params.shift_hours
+            )
+        )
         downtime_total = float(bin_summary['downtime_cost'].sum())
 
-        # opportunity cost: for each task, compare assigned_bin to original interval
+        # --- Opportunity cost (parameterized) ---
         orig_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['interval_fh'].astype(float)))
         first_assigned = locked.groupby('task_id', as_index=False).agg({'bin': 'min'})
+        opp_mode = getattr(params, "opp_mode", "task")
         for _, r in first_assigned.iterrows():
             tid = str(r['task_id'])
             assigned_bin = int(r['bin'])
@@ -643,21 +722,23 @@ def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, para
             if orig_int is None or pd.isna(orig_int):
                 continue
             if assigned_bin < orig_int:
-                # use number of occurrences from locked table for that task
                 occ_count = int(locked[locked['task_id'] == tid].shape[0])
                 early_slack = float(orig_int - assigned_bin)
-                opportunity_cost += early_slack * occ_count * params.revenue_per_hour
+                if opp_mode == "task":
+                    opportunity_cost += early_slack * occ_count * params.revenue_per_hour
+                else:
+                    opportunity_cost += early_slack * (H // assigned_bin) * params.revenue_per_hour
 
-    # line tasks not packaged (category==1)
+    # --- Line tasks cost (category==1 only) ---
     line_tasks_df = tasks_df[(tasks_df['category'] == 1)].copy()
     if not line_tasks_df.empty:
         packaged_ids = set(locked['task_id'].astype(str).unique()) if (locked is not None and not locked.empty) else set()
         remaining_line = line_tasks_df[~line_tasks_df['task_id'].astype(str).isin(packaged_ids)].copy()
         if not remaining_line.empty:
-            # per-task occurrence calculation inside horizon H
             occ = np.ceil(H / remaining_line['interval_fh'].to_numpy(dtype=float))
             mh = remaining_line['manhours'].to_numpy(dtype=float)
-            men = np.where(remaining_line['men'].to_numpy(dtype=float) > 0, remaining_line['men'].to_numpy(dtype=float), 1.0)
+            men = np.where(remaining_line['men'].to_numpy(dtype=float) > 0,
+                           remaining_line['men'].to_numpy(dtype=float), 1.0)
             occ_lab = params.phi * params.labor_rate * mh
             occ_downtime = (mh / men) * params.revenue_per_hour
             occ_overhead = params.ohL
@@ -667,12 +748,9 @@ def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, para
     total_incurred = direct + material + overhead_total + downtime_total + line_cost
     total_with_opportunity = total_incurred + opportunity_cost
 
-    # Safe computation of avg_cost_per_fh
-    effective_H = H if H is not None else params.H
-    avg_cost_per_fh_incurred = total_incurred / max(effective_H, 1e-6)
-    avg_cost_per_fh_with_opportunity = total_with_opportunity / max(effective_H, 1e-6)
+    avg_cost_per_fh_incurred = total_incurred / max(H, 1e-6)
+    avg_cost_per_fh_with_opportunity = total_with_opportunity / max(H, 1e-6)
 
-    # --- Return decomposition ---
     return {
         'total_mh': total_mh,
         'direct': direct,
@@ -691,6 +769,54 @@ def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, para
 # ---------------------------
 # Event package summary builder (CSV export)
 # ---------------------------
+def build_event_downtime_report(
+    locked_df: pd.DataFrame,
+    params: Params,
+    viz_horizon: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Build event-based downtime report (synced with MILP optimizer).
+    Each row represents a maintenance event (FH),
+    where multiple A and/or C packages may coincide.
+    Downtime hours are computed using productivity-based proxy.
+    """
+
+    if locked_df is None or locked_df.empty:
+        return pd.DataFrame()
+
+    df = locked_df.copy()
+    if viz_horizon is not None:
+        df = df[df['due'] <= viz_horizon]
+
+    rows = []
+
+    for due_fh, dfd in df.groupby('due'):
+        total_mh = dfd['mh'].sum()
+
+        # --- Downtime via helper ---
+        downtime_hours = downtime_hours_from_mh(
+            total_mh,
+            man_availability=params.man_availability,
+            efficiency=params.efficiency,
+            shift_hours=params.shift_hours
+        )
+
+        packages = sorted({
+            f"{row['bin']}{row['check_level']}"
+            for _, row in dfd.iterrows()
+        })
+
+        rows.append({
+            'due_fh': due_fh,
+            'packages_executed': " + ".join(packages),
+            'package_count': len(packages),
+            'total_mh': total_mh,
+            'downtime_hours': downtime_hours
+        })
+
+    return pd.DataFrame(rows).sort_values('due_fh').reset_index(drop=True)
+
+
 def build_event_package_summary(locked: pd.DataFrame,
                                 tasks_df: pd.DataFrame,
                                 params: Params,
@@ -701,116 +827,116 @@ def build_event_package_summary(locked: pd.DataFrame,
     Build a detailed summary table of each maintenance event.
     One row per event showing:
       - due_fh: scheduled flight hours
-      - bin: assigned package bin
+      - assigned_bin(s)
       - is_c: whether it's a C-check package
-      - level: 'A' or 'C'
-      - mh_total: total manhours at this event
+      - package: concatenated package labels (e.g., "1A+1C")
+      - total_mh: total manhours at this event
       - task_count: number of tasks in this event
-      - packages: concatenated package labels (e.g., "1A+1C")
       - task_ids: comma-separated task IDs at this event
-      - downtime_hours: estimated downtime
-      - event_cost: direct + material + overhead + downtime for this event
+      - downtime_hours: estimated downtime (using helper)
+      - event_cost: direct + material + overhead + downtime
     """
     if locked is None or locked.empty:
         return pd.DataFrame()
-    
+
     # Filter events within horizon
     df = locked[locked['due'] <= viz_horizon].copy()
-    
+
     # Map task metadata
     men_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['men'].astype(float)))
     cat_map = dict(zip(tasks_df['task_id'].astype(str), tasks_df['category'].astype(int)))
     df['men'] = df['task_id'].map(men_map).fillna(1.0)
-    df['category'] = df['task_id'].map(cat_map).fillna(1).astype(int) # default apron if missing
-    
-    # Group by event (due + bin combination)
+    df['category'] = df['task_id'].map(cat_map).fillna(1).astype(int)
+
     events = []
-    grouped = df.groupby(['due','bin'], as_index=False)
-    
-    # Group tasks by event (due, bin)
     for (due, bin_val), group in df.groupby(['due', 'bin']):
         mh_total = float(group['mh'].sum())
         task_ids = sorted(group['task_id'].unique())
-        # Ensure task ids are strings for concatenation/storage
-        task_ids_str = ';'.join([str(t) for t in task_ids])
+        task_ids_str = ';'.join(task_ids)
         task_count = len(task_ids)
-        men_total = float(group['men'].sum())
-        
+
         # Determine level and package label
         is_c = (bin_val % C == 0)
         level = 'C' if is_c else 'A'
-        pkg_num = bin_val // C if is_c else bin_val // A
+        pkg_num = bin_val // (C if is_c else A)
         package_label = f"{pkg_num}{level}"
 
-        # Determine location based on category mapping
-        # if Any task in event has category==0 -> Hangar, else Apron
+        # Location rule
         location = 'Hangar' if (group['category'] == 0).any() or is_c else 'Apron'
-        
-        # Downtime calculation
-        men_avg = men_total / max(task_count, 1)
-        downtime_hours = mh_total / max(men_avg, 1.0)
-        
-        # Cost calculation
+
+        # Downtime using helper
+        downtime_hours = downtime_hours_from_mh(
+            mh_total,
+            params.man_availability,
+            params.efficiency,
+            params.shift_hours
+        )
+
+        # Cost decomposition
         direct_labour = params.labor_rate * mh_total
         direct = params.phi * direct_labour
         material = params.material_fraction * direct_labour
         overhead = params.ohC if is_c else params.ohA
         downtime_cost = downtime_hours * params.revenue_per_hour
         event_cost = direct + material + overhead + downtime_cost
-        
+
         events.append({
             'due_fh': int(due),
             'assigned_bin': int(bin_val),
             'is_c': is_c,
             'package': package_label,
             'total_mh': mh_total,
-            'total_men': men_total,
             'task_count': task_count,
             'downtime_hours': downtime_hours,
             'event_cost': event_cost,
             'Location': location,
             'task_ids': task_ids_str
-            })
-    
+        })
+
     event_df = pd.DataFrame(events)
-    
-    # If multiple packages at same due, combine them
-    if not event_df.empty:
-        event_df = event_df.sort_values(['due_fh', 'is_c'], ascending=[True, False]).reset_index(drop=True)
-        
-        # Combine packages at same due
-        combined_events = []
-        for due in event_df['due_fh'].unique():
-            due_events = event_df[event_df['due_fh'] == due]
-            
-            if len(due_events) == 1:
-                # Convert the single-row Series to a plain dict so all entries in
-                # `combined_events` are dicts (avoids mixing Series and dicts).
-                combined_events.append(due_events.iloc[0].to_dict())
-            else:
-                # Combine multiple packages at same due
-                packages = '+'.join(due_events['package'].astype(str))
-                task_ids = ';'.join([';'.join(t.split(';')) for t in due_events['task_ids'].astype(str)])
-                
-                combined_row = {
-                    'due_fh': int(due),
-                    'assigned_bin': ';'.join(due_events['assigned_bin'].astype(str)),  # show all bins
-                    'is_c': due_events['is_c'].any(),  # True if any C-check
-                    'package': packages,
-                    'total_mh': due_events['mh_total'].sum(),
-                    'total_men': due_events['total_men'].sum(),
-                    'task_count': due_events['task_count'].sum(),
-                    'downtime_hours': due_events['downtime_hours'].sum(),
-                    'event_cost': due_events['event_cost'].sum(),
-                    'Location': 'Hangar' if (due_events['Location'] == 'Hangar').any() else 'Apron',
-                    'task_ids': task_ids
-                }
-                combined_events.append(combined_row)
-        
-        event_df = pd.DataFrame(combined_events)
-    
-    #Final sorted output
-    return event_df.sort_values('due_fh').reset_index(drop=True)
+
+    # Combine multiple packages at same due
+    combined_events = []
+    for due, due_events in event_df.groupby('due_fh'):
+        if len(due_events) == 1:
+            combined_events.append(due_events.iloc[0].to_dict())
+        else:
+            total_mh = due_events['total_mh'].sum()
+            task_ids = ';'.join(due_events['task_ids'])
+            task_count = due_events['task_count'].sum()
+            packages = '+'.join(due_events['package'])
+            assigned_bins = ';'.join(due_events['assigned_bin'].astype(str))
+            is_c = due_events['is_c'].any()
+            location = 'Hangar' if (due_events['Location'] == 'Hangar').any() else 'Apron'
+
+            # Recompute downtime and cost for combined event
+            downtime_hours = downtime_hours_from_mh(
+                total_mh,
+                params.man_availability,
+                params.efficiency,
+                params.shift_hours
+            )
+            direct_labour = params.labor_rate * total_mh
+            direct = params.phi * direct_labour
+            material = params.material_fraction * direct_labour
+            overhead = params.ohC if is_c else params.ohA
+            downtime_cost = downtime_hours * params.revenue_per_hour
+            event_cost = direct + material + overhead + downtime_cost
+
+            combined_events.append({
+                'due_fh': int(due),
+                'assigned_bin': assigned_bins,
+                'is_c': is_c,
+                'package': packages,
+                'total_mh': total_mh,
+                'task_count': task_count,
+                'downtime_hours': downtime_hours,
+                'event_cost': event_cost,
+                'Location': location,
+                'task_ids': task_ids
+            })
+
+    return pd.DataFrame(combined_events).sort_values('due_fh').reset_index(drop=True)
 
 
 # ---------------------------
@@ -1050,30 +1176,27 @@ def plot_package_histogram(pkg_summary: pd.DataFrame,
 # ---------------------------
 # 3D Cost surface plot
 # ---------------------------
-def plot_cost_3d_surface(cost_df: pd.DataFrame,
-                            savepath: Optional[str] = None,
-                            connect_lines: bool = True):
+def plot_cost_3d_surface(cost_summary_df: pd.DataFrame,
+                         savepath: Optional[str] = None):
     """
-    3D COST SURFACE PLOT
-    --------------------
-    - X = A interval candidates
-    - Y = C interval candidates
-    - Z = avg cost per flight hour (last column in CSV)
-    - Mode = block/equalized (different marker + color)
+    Synchronized 3D cost surface plot for heuristic baseline.
+    Uses cost_summary_df from grid_search_input.
+    Plots avg cost per FH across A and C intervals for both block and equalized modes.
     """
-    if cost_df.empty:
-        print("[WARN] Empty cost_df — cannot plot 3D dual surface.")
+
+    if cost_summary_df.empty:
+        print("[WARN] Empty cost_summary_df — cannot plot 3D surfaces.")
         return None, None
 
-    cols = cost_df.columns.tolist()
-    A_col = cols[0]
-    C_col = cols[1]
-    mode_col = cols[2]
-    Z_col = cols[-1]
+    # Explicit column names
+    A_col = 'A'
+    C_col = 'C'
+    mode_col = 'mode'
+    Z_col = 'avg_cost_per_fh_incurred'
 
-    # Separate block + equalized datasets
-    df_block = cost_df[cost_df[mode_col] == "block"]
-    df_eq = cost_df[cost_df[mode_col] == "equalized"]
+    # Separate block and equalized datasets
+    df_block = cost_summary_df[cost_summary_df[mode_col] == "block"]
+    df_eq = cost_summary_df[cost_summary_df[mode_col] == "equalized"]
 
     # Build pivot grids
     def build_surface(df):
@@ -1082,29 +1205,19 @@ def plot_cost_3d_surface(cost_df: pd.DataFrame,
         Y_vals = pivot.index.to_numpy()
         X, Y = np.meshgrid(X_vals, Y_vals)
         Z = pivot.to_numpy()
-        return X, Y, Z, pivot
+        return X, Y, Z
 
-    Xb, Yb, Zb, pivot_block = build_surface(df_block)
-    Xe, Ye, Ze, pivot_eq = build_surface(df_eq)
+    Xb, Yb, Zb = build_surface(df_block)
+    Xe, Ye, Ze = build_surface(df_eq)
 
     # Build figure
     fig = plt.figure(figsize=(14, 9))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Color bands (Excel style)
-    def color_map(Z, cmap_name):
-        vmin, vmax = np.nanmin(Z), np.nanmax(Z)
-        bounds = np.linspace(vmin, vmax, 7)
-        cmap = plt.get_cmap(cmap_name, len(bounds))
-        return cmap
-
-    cmap_block = color_map(Zb, "Blues")
-    cmap_eq = color_map(Ze, "OrRd")
-
     # --- Plot BLOCK surface ---
     surf_block = ax.plot_surface(
         Xb, Yb, Zb,
-        cmap=cmap_block,
+        cmap="Blues",
         linewidth=0.2,
         alpha=0.85,
         edgecolor='black'
@@ -1113,7 +1226,7 @@ def plot_cost_3d_surface(cost_df: pd.DataFrame,
     # --- Plot EQUALIZED surface ---
     surf_eq = ax.plot_surface(
         Xe, Ye, Ze,
-        cmap=cmap_eq,
+        cmap="OrRd",
         linewidth=0.2,
         alpha=0.85,
         edgecolor='black'
@@ -1131,14 +1244,18 @@ def plot_cost_3d_surface(cost_df: pd.DataFrame,
     )
 
     # Labels
-    ax.set_xlabel(f"{A_col} (A Interval)", fontsize=12, fontweight="bold")
-    ax.set_ylabel(f"{C_col} (C Interval)", fontsize=12, fontweight="bold")
-    ax.set_zlabel("Average Cost per FH", fontsize=12, fontweight="bold")
+    ax.set_xlabel("A Interval", fontsize=12, fontweight="bold")
+    ax.set_ylabel("C Interval", fontsize=12, fontweight="bold")
+    ax.set_zlabel("Avg Cost per FH ($)", fontsize=12, fontweight="bold")
+    ax.set_title("Avg Cost per FH vs A/C Intervals (Block vs Equalized)", fontsize=15, fontweight="bold")
 
-    ax.set_title(title, fontsize=15, fontweight="bold")
-
-    # Match Excel-like viewing angle
+    # Viewing angle
     ax.view_init(elev=35, azim=240)
+
+    # Optional: axis ticks
+    ax.set_xticks(np.arange(min(Xb[0]), max(Xb[0])+1, 100))
+    ax.set_yticks(np.arange(min(Yb[:,0]), max(Yb[:,0])+1, 1000))
+    ax.set_zlim(0, max(np.nanmax(Zb), np.nanmax(Ze)) * 1.1)
 
     plt.tight_layout()
 
@@ -1151,100 +1268,48 @@ def plot_cost_3d_surface(cost_df: pd.DataFrame,
 # ---------------------------
 # Event packages Gantt-like visualization
 # ---------------------------
-def plot_gantt_events(event_df, A_color="#1f77b4", C_color="#d62728"):
+def plot_event_downtime_timeline(
+    event_df: pd.DataFrame,
+    params: Params,
+    savepath: Optional[str] = None
+):
     """
-    Plot a Gantt-style chart for maintenance events.
-    X-axis   : due_fh (scheduled flight hours)
-    Y-axis   : downtime_hours (event duration)
-    Color    : A events = A_color, C or AC combined events = C_color
-
-    Additional annotation below the plot:
-        Average downtime of A events
-        Average downtime of C events
+    Plot Gantt-style timeline of maintenance events.
+    Consumes event_df from build_event_downtime_report for synchronization.
     """
 
     if event_df is None or event_df.empty:
-        print("[WARN] Empty event_df — nothing to plot.")
         return
 
-    df = event_df.copy()
+    fig, ax = plt.subplots(figsize=(12, 6))
 
-    # Determine event type for plotting (combined events count as C)
-    df['event_type'] = df['package'].apply(
-        lambda p: 'C' if ('C' in p) else 'A'
-    )
-
-    # Compute average downtimes
-    avg_A = df[df['event_type'] == 'A']['downtime_hours'].mean()
-    avg_C = df[df['event_type'] == 'C']['downtime_hours'].mean()
-
-    # Prepare plot
-    fig, ax = plt.subplots(figsize=(14, 6))
-
-    # Sort by due_fh for consistent plotting
-    df = df.sort_values('due_fh').reset_index(drop=True)
-
-    # Plot each event as a horizontal bar
-    for idx, row in df.iterrows():
-        x_start = row['due_fh']
-        duration = row['downtime_hours']
-
-        color = A_color if row['event_type'] == 'A' else C_color
-        label = None  # Let legend handle unique labels only
-
+    # Plot each event as a bar
+    for _, row in event_df.iterrows():
         ax.barh(
             y=row['due_fh'],
-            width=duration,
-            left=row['due_fh'],
-            height=200,              # thickness of bar (not too big)
-            color=color,
-            alpha=0.8,
-            edgecolor='black'
+            width=row['downtime_hours'],
+            left=0,
+            height=0.8,
+            color='orange' if 'C' in row['packages_executed'] else 'steelblue',
+            alpha=0.6
         )
-
-        # Text label showing package (e.g., 5A, 1C, 5A+1C)
         ax.text(
-            row['due_fh'] + duration/2,
-            row['due_fh'],
-            row['package'],
-            ha='center',
+            x=row['downtime_hours'] + 0.1,
+            y=row['due_fh'],
+            s=row['packages_executed'],
             va='center',
-            fontsize=9,
-            color='white',
-            weight='bold'
+            fontsize=8
         )
 
-    # Axis labels
-    ax.set_xlabel("Flight Hours (FH)")
-    ax.set_ylabel("Event Downtime (Hours)")
-
-    # Title
-    ax.set_title("Maintenance Event Gantt Chart")
-
-    # Create legend manually
-    handles = [
-        plt.Rectangle((0, 0), 1, 1, color=A_color, alpha=0.8, label="A-check"),
-        plt.Rectangle((0, 0), 1, 1, color=C_color, alpha=0.8, label="C-check / Combined AC")
-    ]
-    ax.legend(handles=handles, loc='upper left')
-
-    # Add annotation box with average downtimes
-    textstr = (
-        f"Average downtime of A events: {avg_A:.2f} hours\n"
-        f"Average downtime of C events: {avg_C:.2f} hours"
-    )
-    plt.gcf().text(
-        0.02, -0.05, textstr,
-        fontsize=10,
-        va='top',
-        ha='left'
-    )
-
-    # Improve layout
+    ax.set_xlabel("Downtime Hours")
+    ax.set_ylabel("Flight Hours (due)")
+    ax.set_title("Event Downtime Timeline (Synced)")
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.2)  # leave space for annotation
 
+    if savepath:
+        plt.savefig(savepath, dpi=300)
     return fig, ax
+
 
 # ---------------------------
 # Grid search driver
@@ -1550,20 +1615,9 @@ def main():
     # ------------------------
     print("\n[SUMMARY] --- OPTIMIZATION COMPLETE ---")
 
-    # Event-level stats for averages and counts (safe guarded)
-    try:
-        A_events = event_pkg_df[event_pkg_df["package"].str.contains("A")] if not event_pkg_df.empty else pd.DataFrame()
-        C_events = event_pkg_df[event_pkg_df["package"].str.contains("C")] if not event_pkg_df.empty else pd.DataFrame()
+    event_df = build_event_downtime_report(assignments_locked_best, params, viz_horizon=args.visual_horizon)
+    event_stats = compute_event_downtime_stats(event_df, C_best, params)
 
-        avg_downtime_A = A_events["downtime_hours"].mean() if not A_events.empty else 0.0
-        avg_downtime_C = C_events["downtime_hours"].mean() if not C_events.empty else 0.0
-
-        total_downtime = float(event_pkg_df["downtime_hours"].sum()) if not event_pkg_df.empty else 0.0
-        total_A_events = len(A_events)
-        total_C_events = len(C_events)
-    except Exception as e:
-        print(f"[WARN] Could not compute event statistics: {e}")
-        avg_downtime_A = avg_downtime_C = total_downtime = total_A_events = total_C_events = 0
 
     # Cost components extraction - flexible to different keys in best['costs']
     costs = best.get("costs", {})
@@ -1592,10 +1646,19 @@ def main():
     print("")
     print("  --- OPERATIONAL METRICS ---")
     print(f"    Total line task unpackaged:  {line_task_count} tasks")
-    print(f"    Total downtime (A + C):      {total_downtime:.2f} hours")
-    print(f"    A events: {total_A_events}   | Avg downtime/A: {avg_downtime_A:.2f} h")
-    print(f"    C events: {total_C_events}   | Avg downtime/C: {avg_downtime_C:.2f} h")
-    print("----------------------------------------\n")
+    print("\n[EVENT-BASED DOWNTIME]")
+    print(f"  All events:")
+    print(f"    Count : {event_stats['total']['count']}")
+    print(f"    Avg   : {event_stats['total']['avg']:.2f} hrs")
+    print(f"    Max   : {event_stats['total']['max']:.2f} hrs")
+    print(f"  A-events:")
+    print(f"    Count : {event_stats['A']['count']}")
+    print(f"    Avg   : {event_stats['A']['avg']:.2f} hrs")
+    print(f"    Max   : {event_stats['A']['max']:.2f} hrs")
+    print(f"  C-events:")
+    print(f"    Count : {event_stats['C']['count']}")
+    print(f"    Avg   : {event_stats['C']['avg']:.2f} hrs")
+    print(f"    Max   : {event_stats['C']['max']:.2f} hrs")
 
     # ------------------------
     # Plots: build in-memory; save only if args.save_plots is True
@@ -1614,7 +1677,7 @@ def main():
 
     try:
         # Gantt: build from event_pkg_df; we used a plot_gantt_events(event_df) style function earlier
-        fig_gantt, ax_gantt = plot_gantt_events(event_pkg_df)
+        fig_gantt, ax_gantt = plot_event_downtime_timeline(event_df, params, savepath=None)
         if args.save_plots:
             gantt_path = results_dir / f"event_packages_gantt_{tag}.png"
             fig_gantt.savefig(gantt_path, dpi=300, bbox_inches='tight')
