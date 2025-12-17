@@ -75,21 +75,27 @@ def load_config(path="config.json"):
         return {}
 
 # ---------------------------
-# Parameters
+# Parameters dataclass
 # ---------------------------
 @dataclass
 class Params:
-    phi: float = 4/3
-    labor_rate: float = 25.0
-    material_fraction: float = 0.33
-    revenue_per_hour: float = 2000.0
-    ohA: float = 1500.0
-    ohC: float = 80000.0
-    ohL: float = 500.0
-    shift_hours: float = 8.0
+    # productivity / labour multipliers
+    phi: float = 3/3
+    labor_rate: float = 60.0               # $ per MH
+    material_fraction: float = 0.33        # fraction of labour for materials
+    revenue_per_hour: float = 14000.0       # $ per aircraft FH lost (opportunity)
+    # overheads
+    ohA: float = 40000.0
+    ohC: float = 300000.0
+    ohL: float = 5000.0
+    # downtime mapping
+    shift_hours: float = 9.0
     mh_per_shift_A: float = 48.0
     mh_per_shift_C: float = 90.0
-    H: int = 50000
+    efficiency: float = 0.3
+    man_availability: float = 10.0
+    # planning horizon default (can be overridden via CLI --H)
+    H: int = 15000
 
 
 # ---------------------------
@@ -140,6 +146,102 @@ def generate_all_potential_bins(H: int, A_candidates: List[int], C_candidates: L
     bins = np.unique(np.concatenate(a_bins_all + c_bins_all if a_bins_all else c_bins_all))
     return bins
 
+# ---------------------------
+# Downtime calculation helper
+# ---------------------------
+def downtime_hours_from_mh(
+    total_mh: float,
+    man_availability: float = 10.0,
+    efficiency: float = 0.3,
+    shift_hours: float = 8.0
+) -> float:
+    """
+    Convert total manhours into equivalent aircraft downtime (hours).
+
+    Formula:
+        downtime_hours = total_mh / (man_availability * efficiency * shift_hours)
+
+    Parameters
+    ----------
+    total_mh : float
+        Total manhours executed in the package or event.
+    man_availability : float
+        Number of available maintenance personnel.
+    efficiency : float
+        Effective productivity factor (0 < efficiency ≤ 1).
+    shift_hours : float
+        Duration of one maintenance shift (hours).
+
+    Returns
+    -------
+    float
+        Aircraft downtime in hours.
+    """
+    denom = man_availability * efficiency * shift_hours
+    if denom <= 0:
+        return 0.0
+    return float(total_mh) / denom
+
+
+def downtime_cost_from_mh(
+    total_mh: float,
+    revenue_per_hour: float,
+    man_availability: float = 10.0,
+    efficiency: float = 0.3,
+    shift_hours: float = 8.0
+) -> float:
+    """
+    Convert total manhours directly into downtime cost.
+
+    Cost = downtime_hours × revenue_per_hour
+    """
+    return (
+        downtime_hours_from_mh(
+            total_mh,
+            man_availability,
+            efficiency,
+            shift_hours
+        ) * revenue_per_hour
+    )
+
+def compute_event_downtime_stats(
+    event_df: pd.DataFrame,
+    chosen_C: int
+) -> Dict[str, Dict[str, float]]:
+    """
+    Compute downtime statistics separated by A and C events
+    using event-level dataframe.
+    """
+
+    if event_df is None or event_df.empty:
+        return {
+            'total': {'avg': 0.0, 'max': 0.0, 'count': 0},
+            'A': {'avg': 0.0, 'max': 0.0, 'count': 0},
+            'C': {'avg': 0.0, 'max': 0.0, 'count': 0},
+        }
+
+    df = event_df.copy()
+
+    # Use correct column name
+    df['event_type'] = df['due_fh'].apply(
+        lambda fh: 'C' if fh % chosen_C == 0 else 'A'
+    )
+
+    def summarize(sub):
+        if sub.empty:
+            return {'avg': 0.0, 'max': 0.0, 'count': 0}
+        return {
+            'avg': float(sub['downtime_hours'].mean()),
+            'max': float(sub['downtime_hours'].max()),
+            'count': int(sub.shape[0])
+        }
+
+    return {
+        'total': summarize(df),
+        'A': summarize(df[df['event_type'] == 'A']),
+        'C': summarize(df[df['event_type'] == 'C']),
+    }
+
 
 # ---------------------------
 # Exact cost recomputation from locked schedule
@@ -162,19 +264,24 @@ def compute_costs_from_locked(locked: pd.DataFrame, tasks_df: pd.DataFrame, para
         bin_summary = df.groupby('bin', as_index=False).agg(total_mh=('mh', 'sum'), total_men=('men', 'sum'))
         bin_summary['is_c'] = bin_summary['bin'] % C == 0
         bin_summary['overhead'] = bin_summary['is_c'].apply(lambda x: params.ohC if x else params.ohA)
-        overhead_total = float(bin_summary['overhead'].sum())
-
-        # downtime: use men if available; fallback to shift buckets if men==0
-        def downtime_cost_calc(r):
-            if r['total_men'] > 0:
-                downtime_hours = float(r['total_mh']) / float(r['total_men'])
-                return downtime_hours * params.revenue_per_hour
+                
+        # overhead        
+        for due_fh in locked['due'].unique():
+            if due_fh % C == 0:
+                overhead_total += params.ohC
             else:
-                cap = params.mh_per_shift_C if r['is_c'] else params.mh_per_shift_A
-                shifts = math.ceil(float(r['total_mh']) / cap) if cap > 0 else 0
-                downtime_hours = shifts * params.shift_hours
-                return downtime_hours * params.revenue_per_hour
-        bin_summary['downtime_cost'] = bin_summary.apply(downtime_cost_calc, axis=1)
+                overhead_total += params.ohA
+        
+        # downtime: use men if available; fallback to shift buckets if men==0
+        bin_summary['downtime_cost'] = bin_summary['total_mh'].apply(
+            lambda mh: downtime_cost_from_mh(
+                mh,
+                params.revenue_per_hour,
+                params.man_availability,
+                params.efficiency,
+                params.shift_hours
+            )
+        )
         downtime_total = float(bin_summary['downtime_cost'].sum())
 
         # opportunity: early assignment penalized by (interval - assigned_bin)+ times occurrence count
@@ -448,7 +555,7 @@ def solve_global_milp(tasks_df: pd.DataFrame,
         material_cost = params.material_fraction * direct_lab
 
         # --- [CHANGE: downtime proxy per bin using mh_bin] ---
-        downtime_proxy = sum((m.mh_bin[t] / avg_men) * params.revenue_per_hour for t in m.BINS)
+        downtime_proxy = sum((m.mh_bin[t] / (params.man_availability * params.efficiency * params.shift_hours)) * params.revenue_per_hour for t in m.BINS)
 
         # Opportunity proxy (parameterized)
         opp_proxy = sum(params.revenue_per_hour *
@@ -535,40 +642,495 @@ def solve_global_milp(tasks_df: pd.DataFrame,
 
 
 # ---------------------------
+# Reporrting helpers
+# ---------------------------
+def build_package_downtime_report(locked_df, params):
+    rows = []
+
+    grouped = locked_df.groupby('bin')
+    for bin_fh, dfb in grouped:
+        check_level = 'C' if dfb['check_level'].iloc[0] == 'C' else 'A'
+        total_mh = dfb['mh'].sum()
+        task_ids = sorted(dfb['task_id'].unique())
+        task_count = len(task_ids)
+
+        downtime = (
+            total_mh /
+            (params.man_availability * params.efficiency * params.shift_hours)
+        )
+
+        rows.append({
+            'package': f"{bin_fh}{check_level}",
+            'bin_interval': bin_fh,
+            'check_level': check_level,
+            'task_count': task_count,
+            'task_ids': ",".join(task_ids),
+            'total_mh': total_mh,
+            'downtime_hours': downtime
+        })
+
+    return pd.DataFrame(rows).sort_values('bin_interval')
+
+def build_event_downtime_report(
+    locked_df: pd.DataFrame,
+    params,
+    viz_horizon: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Build event-based downtime report.
+
+    Each row represents a maintenance event (FH),
+    where multiple A and/or C packages may coincide.
+    """
+
+    if locked_df is None or locked_df.empty:
+        return pd.DataFrame()
+
+    df = locked_df.copy()
+    if viz_horizon is not None:
+        df = df[df['due'] <= viz_horizon]
+
+    rows = []
+
+    for due_fh, dfd in df.groupby('due'):
+        total_mh = dfd['mh'].sum()
+
+        downtime_hours = (
+            total_mh /
+            (params.man_availability * params.efficiency * params.shift_hours)
+        )
+
+        packages = sorted({
+            f"{row['bin']}{row['check_level']}"
+            for _, row in dfd.iterrows()
+        })
+
+        rows.append({
+            'due_fh': due_fh,
+            'packages_executed': " + ".join(packages),
+            'package_count': len(packages),
+            'total_mh': total_mh,
+            'downtime_hours': downtime_hours
+        })
+
+    return pd.DataFrame(rows).sort_values('due_fh').reset_index(drop=True)
+
+def build_detailed_task_package_matrix(
+    locked_df: pd.DataFrame,
+    tasks_df: pd.DataFrame,
+    A: int,
+    C: int,
+    viz_horizon: int
+) -> pd.DataFrame:
+    """
+    Build a detailed task–event execution matrix.
+
+    Rows   : Tasks
+    Cols   : Maintenance event FHs (A and C)
+    Values : 1 if task executes at that FH
+    """
+
+    if locked_df is None or locked_df.empty:
+        print("[WARN] Empty locked_df — cannot build detailed matrix.")
+        return pd.DataFrame()
+
+    # --- Ensure correct dtypes ---
+    locked = locked_df.copy()
+    locked['task_id'] = locked['task_id'].astype(str)
+    locked['due'] = pd.to_numeric(locked['due'], errors='coerce')
+
+    tasks = tasks_df.copy()
+    tasks['task_id'] = tasks['task_id'].astype(str)
+
+    # --- Task metadata ---
+    meta_cols = ['task_id', 'interval_fh', 'manhours']
+    desc_col = next(
+        (c for c in ['task_code', 'description', 'task'] if c in tasks.columns),
+        None
+    )
+    if desc_col:
+        meta_cols.append(desc_col)
+
+    meta = tasks[meta_cols].set_index('task_id')
+
+    # --- Build event columns (A & C events up to viz_horizon) ---
+    event_fhs = sorted(
+        set(range(A, viz_horizon + 1, A)) |
+        set(range(C, viz_horizon + 1, C))
+    )
+
+    col_labels = {
+        fh: f"{fh} (C)" if fh % C == 0 else str(fh)
+        for fh in event_fhs
+    }
+
+    # --- Initialize result table ---
+    result = pd.DataFrame(index=meta.index)
+
+    result['task_interval_fh'] = meta['interval_fh']
+    result['task_mh'] = meta['manhours']
+
+    if desc_col:
+        result['task_description'] = meta[desc_col].astype(str)
+    else:
+        result['task_description'] = ""
+
+    # Assigned package (from first occurrence)
+    first_assign = (
+        locked
+        .groupby('task_id', as_index=False)
+        .agg(
+            assigned_bin=('bin', 'first'),
+            assigned_level=('check_level', 'first')
+        )
+        .set_index('task_id')
+    )
+
+    result = result.join(first_assign, how='left')
+
+    def make_pkg(row):
+        if pd.isna(row['assigned_bin']) or row['assigned_level'] not in ['A', 'C']:
+            return 'Line'
+        base = C if row['assigned_level'] == 'C' else A
+        return f"{int(row['assigned_bin']) // base}{row['assigned_level']}"
+
+    result['assigned_package'] = result.apply(make_pkg, axis=1)
+
+    # Compliance check
+    result['compliance'] = (
+        result['assigned_package'] == 'Line'
+    ) | (
+        result['assigned_bin'] <= result['task_interval_fh']
+    )
+
+    # --- Initialize event columns ---
+    for lbl in col_labels.values():
+        result[lbl] = 0
+
+    # --- Fill execution occurrences directly from locked_df ---
+    for _, r in locked.iterrows():
+        tid = r['task_id']
+        due = r['due']
+        if tid not in result.index or due > viz_horizon:
+            continue
+        if due in col_labels:
+            result.at[tid, col_labels[due]] = 1
+
+    result.reset_index(inplace=True)
+
+    return result
+
+
+def build_compact_validation_report(
+    tasks_df: pd.DataFrame,
+    candidates: pd.DataFrame,
+    locked_df: pd.DataFrame,
+    chosen_mode: str,
+    A: int,
+    C: int,
+    H: int
+) -> pd.DataFrame:
+    """
+    Compact validation report (one row per task).
+
+    Columns include:
+      task_id, task_code, zone, category, interval_fh, manhours,
+      assigned_level, assigned_bin, occurrence_count, mh_per_occ,
+      task_package
+    """
+
+    td = tasks_df.copy()
+    td['task_id'] = td['task_id'].astype(str)
+
+    # ---------------------------
+    # Occurrence & assignment info
+    # ---------------------------
+    if locked_df is None or locked_df.empty:
+        occ_df = pd.DataFrame(columns=['task_id', 'occurrence_count', 'assigned_bin', 'mh_per_occ', 'assigned_level'])
+    else:
+        occ_df = (
+            locked_df
+            .groupby('task_id', as_index=False)
+            .agg(
+                occurrence_count=('due', 'count'),
+                assigned_bin=('bin', 'first'),
+                mh_per_occ=('mh', 'mean'),
+                assigned_level=('assigned_level', 'first')
+            )
+        )
+
+    # ---------------------------
+    # Candidate slack (optional)
+    # ---------------------------
+    if candidates is None or candidates.empty:
+        cand_df = pd.DataFrame(columns=['task_id', 'candidate_min_slack'])
+    else:
+        cand_df = (
+            candidates
+            .groupby('task_id', as_index=False)
+            .agg(candidate_min_slack=('slack', 'min'))
+        )
+
+    # ---------------------------
+    # Merge all
+    # ---------------------------
+    val = (
+        td
+        .merge(occ_df, on='task_id', how='left')
+        .merge(cand_df, on='task_id', how='left')
+    )
+
+    # ---------------------------
+    # Package label (from MILP decision)
+    # ---------------------------
+    def compute_task_package(row):
+        b = row.get('assigned_bin')
+        lvl = row.get('assigned_level')
+        if pd.isna(b) or lvl not in ['A', 'C']:
+            return None
+        try:
+            b = int(b)
+        except Exception:
+            return None
+        base = C if lvl == 'C' else A
+        return f"{b // base}{lvl}"
+
+    val['task_package'] = val.apply(compute_task_package, axis=1)
+    val['chosen_mode'] = chosen_mode
+
+    # ---------------------------
+    # Defaults & line-task handling
+    # ---------------------------
+    val['occurrence_count'] = val['occurrence_count'].fillna(0).astype(int)
+    val['mh_per_occ'] = val['mh_per_occ'].fillna(0.0)
+    val['candidate_min_slack'] = val['candidate_min_slack'].fillna(0.0)
+
+    # Mark unpackaged category==1 tasks as Line
+    if 'category' in val.columns:
+        mask_line = (val['category'] == 1) & (val['occurrence_count'] == 0)
+        val.loc[mask_line, 'assigned_level'] = 'Line'
+        val.loc[mask_line, 'assigned_bin'] = None
+        val.loc[mask_line, 'task_package'] = 'Line'
+
+    # ---------------------------
+    # Select output columns
+    # ---------------------------
+    cols = [
+        'task_id', 'task_code', 'zone', 'category',
+        'interval_fh', 'manhours',
+        'assigned_level', 'assigned_bin',
+        'occurrence_count', 'mh_per_occ',
+        'task_package'
+    ]
+
+    return val[[c for c in cols if c in val.columns]]
+
+
+# ---------------------------
 # Plotting helpers
 # ---------------------------
-def plot_package_histogram(pkg_summary: pd.DataFrame, A: int, C: int, viz_horizon: int, savepath: Optional[str] = None):
-    plt.figure(figsize=(12, 5))
-    if pkg_summary is not None and not pkg_summary.empty:
-        x = pkg_summary['bin_end_fh']
-        heights = pkg_summary['total_mh']
-        widths = pkg_summary['assigned_level'].apply(lambda lvl: A * 0.6 if lvl == 'A' else C * 0.6)
-        colors = pkg_summary['assigned_level'].apply(lambda lvl: 'steelblue' if lvl == 'A' else 'orange')
-        plt.bar(x, heights, width=widths, color=colors, align='center', edgecolor='k', alpha=0.8)
-    plt.xlabel('Flight Hours (FH)')
-    plt.ylabel('Total Manhours per Package (MH)')
-    plt.title(f'Workload Distribution (0–{viz_horizon} FH)')
-    plt.grid(axis='y', linestyle='--', alpha=0.5)
+def plot_package_histogram(
+    pkg_summary: pd.DataFrame,
+    tasks_df: pd.DataFrame,
+    locked_df: pd.DataFrame,
+    params,
+    viz_horizon: int,
+    savepath: Optional[str] = None
+):
+    """
+    Package-level plot with task scatter overlay.
+
+    Bars  : Package downtime (per execution)
+    Line  : Total MH per package
+    Dots  : Task input data (interval vs MH)
+            - Packaged tasks (colored)
+            - Unpackaged tasks (grey)
+    """
+
+    if pkg_summary is None or pkg_summary.empty:
+        return
+
+    # -------------------------------
+    # Prepare package data
+    # -------------------------------
+    df = pkg_summary.copy()
+
+    # Compute downtime per package execution
+    df['downtime_hours'] = (
+        df['total_mh'] /
+        (params.man_availability * params.efficiency * params.shift_hours)
+    )
+
+    x_pkg = df['bin_end_fh']
+    width_pkg = df['bin_end_fh'] * 0.20  # ±10% around bin center
+
+    colors_pkg = df['assigned_level'].map({
+        'A': 'steelblue',
+        'C': 'orange'
+    })
+
+    # -------------------------------
+    # Prepare task data
+    # -------------------------------
+    tasks = tasks_df.copy()
+    tasks = tasks[tasks['interval_fh'] <= viz_horizon]
+
+    packaged_task_ids = set(locked_df['task_id'].astype(str).unique())
+    tasks['is_packaged'] = tasks['task_id'].astype(str).isin(packaged_task_ids)
+
+    # -------------------------------
+    # Plot
+    # -------------------------------
+    fig, ax1 = plt.subplots(figsize=(14, 6))
+
+    # --- Package downtime bars ---
+    ax1.bar(
+        x_pkg,
+        df['downtime_hours'],
+        width=width_pkg,
+        color=colors_pkg,
+        edgecolor='k',
+        alpha=0.85,
+        label='Downtime per Package'
+    )
+
+    ax1.set_xlabel('Flight Hours (FH)')
+    ax1.set_ylabel('Downtime per Package Execution (hours)')
+    ax1.grid(axis='y', linestyle='--', alpha=0.4)
+
+    # --- Secondary axis: package total manhours ---
+    ax2 = ax1.twinx()
+    ax2.plot(
+        x_pkg,
+        df['total_mh'],
+        linestyle='--',
+        marker='s',
+        linewidth=1.8,
+        color='black',
+        label='Total Manhours per Package'
+    )
+    ax2.set_ylabel('Total Manhours per Package (MH)')
+
+    # -------------------------------
+    # Task scatter overlay
+    # -------------------------------
+    ax2.scatter(
+        tasks.loc[~tasks['is_packaged'], 'interval_fh'],
+        tasks.loc[~tasks['is_packaged'], 'manhours'],
+        color='lightgrey',
+        alpha=0.6,
+        s=30,
+        label='Unpackaged Tasks'
+    )
+
+    ax2.scatter(
+        tasks.loc[tasks['is_packaged'], 'interval_fh'],
+        tasks.loc[tasks['is_packaged'], 'manhours'],
+        color='red',
+        alpha=0.8,
+        s=40,
+        label='Packaged Tasks'
+    )
+
+    # -------------------------------
+    # Title & legend
+    # -------------------------------
+    ax1.set_title(
+        f'Package–Task Interaction and Workload Distribution (0–{viz_horizon} FH)'
+    )
+
+    # Legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+
     if savepath:
         plt.savefig(savepath, bbox_inches='tight', dpi=200)
+
     plt.close()
 
 
-def plot_occurrence_histogram(locked: pd.DataFrame, C: int, viz_horizon: int, savepath: Optional[str] = None):
-    if locked is None or locked.empty:
+def plot_event_downtime_timeline(
+    locked_df: pd.DataFrame,
+    params,
+    chosen_C: int,
+    viz_horizon: int,
+    savepath: Optional[str] = None
+):
+    """
+    Event-based downtime plot.
+
+    Each bar represents a maintenance event (FH),
+    where multiple A/C packages may coincide.
+    """
+
+    if locked_df is None or locked_df.empty:
         return
-    df = locked[locked['due'] <= viz_horizon].copy()
-    occ = df.groupby(['due', 'bin'], as_index=False)['mh'].sum().sort_values('due')
+
+    df = locked_df[locked_df['due'] <= viz_horizon].copy()
+    if df.empty:
+        return
+
+    # --- Aggregate by maintenance event ---
+    event_summary = (
+        df.groupby('due', as_index=False)
+          .agg(
+              total_mh=('mh', 'sum'),
+              package_count=('bin', 'nunique')
+          )
+          .sort_values('due')
+    )
+
+    # --- Downtime calculation ---
+    event_summary['downtime_hours'] = (
+        event_summary['total_mh'] /
+        (params.man_availability * params.efficiency * params.shift_hours)
+    )
+
+    # --- Event type ---
+    event_summary['event_type'] = event_summary['due'].apply(
+        lambda x: 'C' if x % chosen_C == 0 else 'A'
+    )
+
+    colors = event_summary['event_type'].map({
+        'A': 'steelblue',
+        'C': 'orange'
+    })
+
+    # --- Plot ---
     plt.figure(figsize=(14, 6))
-    colors = ['orange' if (row['bin'] % C == 0) else 'steelblue' for _, row in occ.iterrows()]
-    plt.bar(occ['due'], occ['mh'], color=colors, width=max(1, int(viz_horizon/200)),
-            align='center', edgecolor='k', alpha=0.85)
+    bars = plt.bar(
+        event_summary['due'],
+        event_summary['downtime_hours'],
+        color=colors,
+        width=max(1, int(viz_horizon / 200)),
+        edgecolor='k',
+        alpha=0.85
+    )
+
+    # --- Annotate package count ---
+    for bar, pkg_cnt in zip(bars, event_summary['package_count']):
+        if pkg_cnt > 1:
+            plt.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f'{pkg_cnt} pkg',
+                ha='center',
+                va='bottom',
+                fontsize=8,
+                rotation=90
+            )
+
     plt.xlabel('Flight Hours (FH)')
-    plt.ylabel('Total Manhours scheduled (MH)')
-    plt.title(f'Package events up to {viz_horizon} FH')
+    plt.ylabel('Total Downtime per Maintenance Event (hours)')
+    plt.title(
+        'Maintenance Event Downtime Timeline\n'
+    )
     plt.grid(axis='y', linestyle='--', alpha=0.4)
+
     if savepath:
         plt.savefig(savepath, bbox_inches='tight', dpi=200)
+
     plt.close()
 
 
@@ -597,7 +1159,7 @@ def parse_args():
     p.add_argument('--Wpeak', type=float, default=40.0, help="peak manhours capacity per package")
     p.add_argument('--time_limit', type=int, default=600, help="Gurobi time limit (s)")
     p.add_argument('--mip_gap', type=float, default=0.01, help="Relative MIPGap")
-    p.add_argument('--viz_horizon', type=int, default=50000)
+    p.add_argument('--viz_horizon', type=int, default=15000)
     p.add_argument('--save_outputs', action='store_true')
     p.add_argument('--save_validation', action='store_true')
     p.add_argument('--save_package_summary', action='store_true')
@@ -683,6 +1245,15 @@ def main():
     locked_df = res['locked_df']
     exact = res['exact_costs']
 
+    event_df = build_event_downtime_report(
+        locked_df,
+        params,
+        viz_horizon=args.viz_horizon
+    )
+
+
+    event_stats = compute_event_downtime_stats(event_df, C_best)
+
     print("\n[SUMMARY] --- GLOBAL OPTIMUM ---")
     print(f"  Chosen A-check interval: {A_best}")
     print(f"  Chosen C-check interval: {C_best}")
@@ -693,25 +1264,108 @@ def main():
     print(f"  Avg cost per FH (incurred): {exact['avg_cost_per_fh_incurred']:.6f}")
     print(f"  Avg cost per FH (with opportunity): {exact['avg_cost_per_fh_with_opportunity']:.6f}")
     print("----------------------------------------\n")
+    print("\n[EVENT-BASED DOWNTIME]")
+    print(f"  All events:")
+    print(f"    Count : {event_stats['total']['count']}")
+    print(f"    Avg   : {event_stats['total']['avg']:.2f} hrs")
+    print(f"    Max   : {event_stats['total']['max']:.2f} hrs")
+    print(f"  A-events:")
+    print(f"    Count : {event_stats['A']['count']}")
+    print(f"    Avg   : {event_stats['A']['avg']:.2f} hrs")
+    print(f"    Max   : {event_stats['A']['max']:.2f} hrs")
+    print(f"  C-events:")
+    print(f"    Count : {event_stats['C']['count']}")
+    print(f"    Avg   : {event_stats['C']['avg']:.2f} hrs")
+    print(f"    Max   : {event_stats['C']['max']:.2f} hrs")
+    print("----------------------------------------\n")
+    
+    # Save validation report
+    # ---------------------------------------------
+    # Build summaries
+    # ---------------------------------------------
+    pkg_summary = build_package_summary_from_locked(
+        locked_df,
+        A_best,
+        C_best,
+        args.viz_horizon
+    )
 
-    # Package summary and matrix
-    pkg_summary = build_package_summary_from_locked(locked_df, A_best, C_best, args.viz_horizon)
-    task_bin_matrix = build_task_bin_matrix(locked_df, tasks_df)
+    task_bin_matrix = build_task_bin_matrix(
+        locked_df,
+        tasks_df
+    )
 
-    # Save outputs
+    detailed_matrix = build_detailed_task_package_matrix(
+        locked_df=locked_df,
+        tasks_df=tasks_df,
+        A=A_best,
+        C=C_best,
+        viz_horizon=args.viz_horizon
+    )
+
     tag = f"A{A_best}_C{C_best}"
-    if args.save_outputs:
-        locked_df.to_csv(f"milp_locked_{tag}.csv", index=False)
-        pkg_summary.to_csv(f"milp_pkg_summary_{tag}.csv", index=False)
-        task_bin_matrix.to_csv(f"milp_task_bin_matrix_{tag}.csv", index=False)
-        pd.DataFrame([exact]).to_csv("cost_summary_global_choice.csv", index=False)
 
-    # Plots
-    plot_package_histogram(pkg_summary, A_best, C_best, args.viz_horizon, savepath=f"milp_pkg_hist_{tag}.png" if args.save_outputs else None)
-    plot_occurrence_histogram(locked_df, C_best, args.viz_horizon, savepath=f"milp_occ_hist_{tag}.png" if args.save_outputs else None)
+    # ---------------------------------------------
+    # Save validation / raw outputs
+    # ---------------------------------------------
+    if args.save_validation:
+        locked_df.to_csv(f"milp_locked_{tag}.csv", index=False)        
+        pd.DataFrame([exact]).to_csv(
+            "cost_summary_global_choice.csv", 
+            index=False
+        )
+        detailed_matrix.to_csv(
+            f"milp_task_package_validation_{tag}.csv",
+            index=False
+        )
 
+    # ---------------------------------------------
+    # Save package summaries
+    # ---------------------------------------------
+    if args.save_package_summary:
+        pkg_summary.to_csv(
+            f"milp_pkg_summary_{tag}.csv",
+            index=False
+        )
+        task_bin_matrix.to_csv(
+            f"milp_task_bin_matrix_{tag}.csv",
+            index=False
+        )
+        event_df.to_csv(
+            f"milp_event_downtime_{tag}.csv", 
+            index=False
+        )
+
+    # ---------------------------------------------
+    # Generate plots
+    # ---------------------------------------------
+    if args.save_plots:
+        plot_event_downtime_timeline(
+            locked_df=locked_df,
+            params=params,
+            chosen_C=C_best,
+            viz_horizon=args.viz_horizon,
+            savepath=f"fig_event_downtime_{tag}.png"
+        )
+
+        plot_package_histogram(
+            pkg_summary=pkg_summary,
+            tasks_df=tasks_df,
+            locked_df=locked_df,
+            params=params,
+            viz_horizon=args.viz_horizon,
+            savepath=f"fig_package_task_interaction_{tag}.png"
+        )
+
+    # ---------------------------------------------
+    # Final log
+    # ---------------------------------------------
     elapsed = time.time() - start
-    print(f"[INFO] MILP completed in {elapsed:.1f}s. Outputs saved: {args.save_outputs}")
+    print(f"[INFO] MILP completed in {elapsed:.1f}s")
+    print(f"[INFO] Outputs:")
+    print(f"  Validation CSV     : {args.save_validation}")
+    print(f"  Package summaries  : {args.save_package_summary}")
+    print(f"  Figures generated  : {args.save_plots}")
     print("[INFO] Done.")
 
 
